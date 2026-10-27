@@ -1481,10 +1481,31 @@ impl Tool for ClickTool {
                                     false,
                                 ))
                             } else if focus_only {
-                                if crate::input::ax_actions::focus_element(element as usize).is_ok() {
-                                    PixelHit::Delivered
-                                } else {
-                                    PixelHit::Missed
+                                // A web page field (the hit is often its
+                                // placeholder text) gets the token route's
+                                // focus: a background Safari page ignores the
+                                // focus write alone.
+                                match super::type_text::web_text_field_at(pid, element, hit_test_wid) {
+                                    Some(field) => {
+                                        let _ = crate::input::ax_actions::focus_element(field as usize);
+                                        let focused = super::type_text::focus_web_field(
+                                            pid,
+                                            field,
+                                            Some(hit_test_wid),
+                                        );
+                                        CFRelease(field as _);
+                                        if focused {
+                                            PixelHit::Delivered
+                                        } else {
+                                            PixelHit::Missed
+                                        }
+                                    }
+                                    None if crate::input::ax_actions::focus_element(element as usize)
+                                        .is_ok() =>
+                                    {
+                                        PixelHit::Delivered
+                                    }
+                                    None => PixelHit::Missed,
                                 }
                             } else {
                                 // An element that offers no press gets the

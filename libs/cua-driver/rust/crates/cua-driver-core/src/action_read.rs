@@ -40,6 +40,32 @@ fn split(result: ToolResult) -> (Vec<Content>, ActionReadChildResult) {
         },
     )
 }
+/// A step's `next_call` that names an element_token from a snapshot the
+/// closing observation replaced would be refused as stale: drop it. The
+/// step's text still says what to do, with a token from the observation.
+fn drop_stale_next_call(child: &mut ActionReadChildResult, observation: &ActionReadChildResult) {
+    let Some(structured) = child.structured_content.as_mut() else {
+        return;
+    };
+    let Some(token) = structured
+        .pointer("/next_call/arguments/element_token")
+        .and_then(Value::as_str)
+    else {
+        return;
+    };
+    let snapshot = token.split(':').next().unwrap_or_default();
+    let replaced = observation
+        .structured_content
+        .as_ref()
+        .and_then(|o| o.get("invalidated_snapshot_ids"))
+        .and_then(Value::as_array)
+        .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(snapshot)));
+    if replaced {
+        if let Some(object) = structured.as_object_mut() {
+            object.remove("next_call");
+        }
+    }
+}
 #[async_trait]
 impl Tool for ActAndReadTool {
     fn def(&self) -> &ToolDef {
@@ -157,6 +183,9 @@ impl Tool for ActAndReadTool {
             total_ms: millis(started.elapsed()),
         };
         let (observation_content, observation) = split(observation_result);
+        for (_, child) in &mut results {
+            drop_stale_next_call(child, &observation);
+        }
         let is_error = stopped_at.is_some() || observation.is_error == Some(true);
         let mut content = vec![];
         let mut step_results = vec![];
@@ -214,4 +243,39 @@ fn step_call(base: &Value, step: &ActionReadStep) -> (&'static str, Value) {
         object.insert("delivery_mode".into(), json!("background"));
     }
     (step.action.as_str(), call)
+}
+
+#[cfg(test)]
+mod stale_next_call_tests {
+    use super::*;
+
+    fn child(token: &str) -> ActionReadChildResult {
+        ActionReadChildResult {
+            is_error: Some(true),
+            structured_content: Some(json!({
+                "code": "web_field_not_focused",
+                "next_call": {"tool": "type_text", "arguments": {"element_token": token, "text": "x"}},
+            })),
+        }
+    }
+
+    fn observation(invalidated: &[&str]) -> ActionReadChildResult {
+        ActionReadChildResult {
+            is_error: None,
+            structured_content: Some(json!({"snapshot_id": "s00000005", "invalidated_snapshot_ids": invalidated})),
+        }
+    }
+
+    #[test]
+    fn a_next_call_with_a_token_the_observation_replaced_is_dropped() {
+        let mut stale = child("s00000004:12");
+        drop_stale_next_call(&mut stale, &observation(&["s00000004"]));
+        let data = stale.structured_content.unwrap();
+        assert!(data.get("next_call").is_none(), "{data}");
+        assert_eq!(data["code"], "web_field_not_focused");
+
+        let mut current = child("s00000004:12");
+        drop_stale_next_call(&mut current, &observation(&["s00000003"]));
+        assert!(current.structured_content.unwrap().get("next_call").is_some());
+    }
 }
