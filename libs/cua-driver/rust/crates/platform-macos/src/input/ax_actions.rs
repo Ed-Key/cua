@@ -130,12 +130,34 @@ pub(crate) fn web_ancestry(roles: impl IntoIterator<Item = Option<String>>) -> W
     WebAncestry::Unknown
 }
 
-/// Whether a row of `kind` may be handled as found. Web content is never a
-/// Catalyst row: its AXSelected follows aria-selected, not what the page does
-/// on a click, so the Catalyst read-back and retry ladder would misjudge it
-/// and could act twice. Only a walk that reached the window proves it is not.
-fn catalyst_row_allowed(kind: RowKind, ancestry: impl FnOnce() -> WebAncestry) -> bool {
-    kind != RowKind::Catalyst || ancestry() == WebAncestry::Outside
+/// [`find_row`] for an element whose place relative to web content is
+/// `ancestry`, read before any peer scan. Web content is never a row, AppKit
+/// or Catalyst: its AXSelected follows aria-selected (WebKit reports one on
+/// every element, a Compose image included), not what the page does on a
+/// click, so the read-back and retry ladder would misjudge it and act two or
+/// three times. Only a walk that reached the window proves it is not web
+/// content.
+pub(crate) fn find_row_outside_web(
+    chain: &mut [RowCandidate],
+    ancestry: WebAncestry,
+    scan_peers: impl FnMut(usize) -> Option<(usize, bool, bool)>,
+) -> Option<(usize, RowKind)> {
+    if ancestry != WebAncestry::Outside {
+        return None;
+    }
+    find_row(chain, scan_peers)
+}
+
+/// Whether `element_ptr` is proven to sit outside web content (its AXParent
+/// walk reached the window or application with no AXWebArea). Selection
+/// read-backs and AX hit-test presses apply only there.
+pub(crate) fn outside_web_content(element_ptr: usize) -> bool {
+    web_ancestry_of_element(element_ptr) == WebAncestry::Outside
+}
+
+/// [`web_ancestry`] of the element at `element_ptr`.
+pub(crate) fn web_ancestry_of_element(element_ptr: usize) -> WebAncestry {
+    unsafe { web_ancestry_of(element_ptr as AXUIElementRef) }
 }
 
 /// [`web_ancestry`] of `element`, walking its AXParent chain lazily.
@@ -290,6 +312,12 @@ impl RowSelection {
             if clicked_role.as_deref().is_some_and(is_control_role) {
                 return None;
             }
+            // Web content first: its rows are never read back, and the
+            // walk below would scan the peers of every selectable element.
+            let ancestry = web_ancestry_of(element_ptr as AXUIElementRef);
+            if ancestry != WebAncestry::Outside {
+                return None;
+            }
             let mut chain = Vec::new();
             let mut elements = Vec::new();
             let mut current = element_ptr as AXUIElementRef;
@@ -315,7 +343,7 @@ impl RowSelection {
                 CFRetain(parent as CFTypeRef);
                 current = parent;
             }
-            let chosen = find_row(&mut chain, |at| {
+            let chosen = find_row_outside_web(&mut chain, ancestry, |at| {
                 elements[at].1.map(|parent| {
                     if advertises_attribute(parent, "AXSelectedChildren") {
                         return (0, false, true);
@@ -323,13 +351,6 @@ impl RowSelection {
                     let (peers, _, any, _) = scan_selection(parent, None);
                     (peers, any, false)
                 })
-            })
-            // Web content is never a Catalyst row: its AXSelected follows
-            // aria-selected, not what the page does on a click (the ChatGPT
-            // sidebar switches chats and leaves the mark where it was), so
-            // the read-back would call a working click a failure.
-            .filter(|(_, kind)| {
-                catalyst_row_allowed(*kind, || web_ancestry_of(element_ptr as AXUIElementRef))
             });
             let mut result = None;
             for (at, (element, parent)) in elements.into_iter().enumerate() {
@@ -537,6 +558,10 @@ pub(crate) fn ax_write_rejected(err: AXError) -> bool {
 /// exposes `AXSelected` but refuses to set it directly (notably Finder icon
 /// views).
 pub fn nearest_container_selection_state(element_ptr: usize) -> Option<(String, bool)> {
+    // A page's AXSelected is no read-back (see find_row_outside_web).
+    if !outside_web_content(element_ptr) {
+        return None;
+    }
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
@@ -615,6 +640,10 @@ impl Drop for SelectionReadback {
 /// Returns `None` when the platform does not expose a readable selection model;
 /// callers must then leave the action unverifiable instead of inventing proof.
 pub fn capture_nearest_container_selection(element_ptr: usize) -> Option<SelectionReadback> {
+    // A page's AXSelected is no read-back (see find_row_outside_web).
+    if !outside_web_content(element_ptr) {
+        return None;
+    }
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
@@ -712,10 +741,50 @@ mod tests {
         // A role that did not read, and a parent that did not.
         assert_eq!(web_ancestry(with(groups(3), None)), WebAncestry::Unknown);
         assert_eq!(web_ancestry(groups(3)), WebAncestry::Unknown);
-        assert!(!catalyst_row_allowed(RowKind::Catalyst, || WebAncestry::Unknown));
-        assert!(!catalyst_row_allowed(RowKind::Catalyst, || WebAncestry::Inside));
-        assert!(catalyst_row_allowed(RowKind::Catalyst, || WebAncestry::Outside));
-        assert!(catalyst_row_allowed(RowKind::Native, || WebAncestry::Unknown));
+    }
+
+    /// Fix batch 3: a page element is never a row, of either kind. The
+    /// pilot's Gmail Compose and Checkbox images (WebKit gives every element
+    /// an AXSelected) were taken for AppKit icon rows and got a selection
+    /// write, a press and a pointer click, then "row not selected". An
+    /// unproven walk is not outside either. AppKit and Catalyst rows outside
+    /// web content keep their verified selection, and web content is decided
+    /// before any peer scan.
+    #[test]
+    fn web_content_is_never_a_row_of_either_kind() {
+        let image = || vec![step("AXImage", true, 0, false), step("AXGroup", true, 0, false)];
+        let stocks = || {
+            vec![
+                step("AXGenericElement", true, 0, false),
+                step("AXGroup", true, 0, false),
+                step("AXGroup", true, 0, false),
+            ]
+        };
+        let peers = |at: usize| Some(if at == 0 { (1, false, false) } else { (11, true, false) });
+        for ancestry in [WebAncestry::Inside, WebAncestry::Unknown] {
+            let mut scans = 0;
+            let found = find_row_outside_web(&mut image(), ancestry, |at| {
+                scans += 1;
+                peers(at)
+            });
+            assert_eq!((found, scans), (None, 0), "image {ancestry:?}");
+            let mut scans = 0;
+            let found = find_row_outside_web(&mut stocks(), ancestry, |at| {
+                scans += 1;
+                peers(at)
+            });
+            assert_eq!((found, scans), (None, 0), "catalyst {ancestry:?}");
+        }
+        assert_eq!(
+            find_row_outside_web(&mut image(), WebAncestry::Outside, peers),
+            Some((0, RowKind::Native)),
+            "a Finder icon"
+        );
+        assert_eq!(
+            find_row_outside_web(&mut stocks(), WebAncestry::Outside, peers),
+            Some((1, RowKind::Catalyst)),
+            "a Stocks row"
+        );
     }
 
     #[test]
