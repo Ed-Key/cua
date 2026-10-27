@@ -281,6 +281,20 @@ fn settled_value(
     }
 }
 
+/// Whether a background x,y click is delivered through the element its AX
+/// hit test finds (a press, a row selection, a focus) instead of the routed
+/// pointer click at the point. A page element takes the pointer click, once:
+/// an AX press runs only what the browser's press action runs, which is not
+/// what a click at that point runs (see the fix batch 3 evidence), and a
+/// page's AXSelected is no row read-back. type_text's pixel focus keeps its
+/// AX focus route.
+fn hit_test_delivers_via_ax(
+    focus_only: bool,
+    ancestry: impl FnOnce() -> crate::input::ax_actions::WebAncestry,
+) -> bool {
+    focus_only || ancestry() == crate::input::ax_actions::WebAncestry::Outside
+}
+
 fn pixel_activation_policy(
     button: &str,
     effective_foreground: bool,
@@ -1454,6 +1468,12 @@ impl Tool for ClickTool {
                                 CFRelease(element as _);
                                 return Ok(PixelHit::Missed);
                             }
+                            if !hit_test_delivers_via_ax(focus_only, || {
+                                crate::input::ax_actions::web_ancestry_of_element(element as usize)
+                            }) {
+                                CFRelease(element as _);
+                                return Ok(PixelHit::Missed);
+                            }
                             let row = (!focus_only)
                                 .then(|| crate::input::ax_actions::RowSelection::capture_for_hit(element as usize))
                                 .flatten()
@@ -2096,6 +2116,42 @@ fn perform_ax_click(
         }
     }
 
+    // A page text field (outside Electron) takes focus the way type_text
+    // gives it: the AXFocused write, then its press only when the write left
+    // focus elsewhere, proven through its window's own focused element. A
+    // press alone left a background Safari page's textarea unfocused (fix
+    // batch 1's probe, 6 of 6).
+    if ax_action == "AXPress" && modifiers.is_empty() && is_text_entry_role(&role) {
+        if let Some(field) = super::type_text::web_text_field_at(pid, element, window_id) {
+            unsafe { CFRelease(field as CFTypeRef) };
+            let _ = crate::input::ax_actions::focus_element(element_ptr);
+            return Ok(if super::type_text::focus_web_field(pid, element, Some(window_id)) {
+                (
+                    format!(
+                        "✅ Focused [{idx}] {role} \"{title}\": the page field has keyboard focus, \
+                         confirmed through its window's focused element."
+                    ),
+                    false,
+                    false,
+                    true,
+                    false,
+                )
+            } else {
+                (
+                    format!(
+                        "📨 Asked [{idx}] {role} \"{title}\" for keyboard focus (focus write and its \
+                         press), but its window still reports another element focused; read the \
+                         window before typing."
+                    ),
+                    false,
+                    false,
+                    false,
+                    false,
+                )
+            });
+        }
+    }
+
     // A click on an AppKit collection item is frequently represented by a
     // label child that does not advertise AXPress. A modified click on it
     // is a pointer click at the item, confirmed by read-back.
@@ -2480,7 +2536,7 @@ mod settled_hit_tests {
 
 #[cfg(test)]
 mod click_dispatch_tests {
-    use super::{click_dispatch, ClickDispatch};
+    use super::{click_dispatch, hit_test_delivers_via_ax, ClickDispatch};
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| name.to_string()).collect()
@@ -2488,6 +2544,20 @@ mod click_dispatch_tests {
 
     fn ax(action: &str) -> ClickDispatch {
         ClickDispatch::Ax(action.into())
+    }
+
+    /// Fix batch 3: a background x,y click on a page element is the routed
+    /// pointer click, never an AX press of the hit element (the pilot's
+    /// Linear issue row: "PX hit-test pressed ... via AX", nothing opened,
+    /// then a foreground click). Outside web content the hit-test press
+    /// stays; an unproven walk counts as web; the pixel focus keeps AX.
+    #[test]
+    fn a_background_pixel_click_on_a_page_is_a_pointer_click() {
+        use crate::input::ax_actions::WebAncestry;
+        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Inside));
+        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Unknown));
+        assert!(hit_test_delivers_via_ax(false, || WebAncestry::Outside));
+        assert!(hit_test_delivers_via_ax(true, || WebAncestry::Inside));
     }
 
     #[test]
