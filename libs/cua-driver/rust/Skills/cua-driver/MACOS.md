@@ -623,7 +623,11 @@ not take focus is refused with `code:"web_field_not_focused"` before any key;
 its `next_call` is the same call with `delivery_mode:"foreground"`. A result
 that reads the text back is still `⚠️ Not confirmed:` (web content) with no
 escalation: check the page's own response (search results, a draft) instead of
-typing again, and prefer the `element_token` over the `x,y` form there.
+typing again. From behind, `x,y` on a page field addresses that field the same
+way, and so does an untargeted `type_text` into a page whose field has focus; an
+untargeted call into a page where no field has focus is refused with
+`code:"web_page_has_no_focused_field"` before any key, because a key on the page
+itself can be a shortcut.
 
 ## macOS common error patterns
 

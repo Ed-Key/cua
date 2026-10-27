@@ -260,6 +260,8 @@ struct EditorFixture {
     /// does nothing, `None` is not offered.
     press: Option<bool>,
     presses: usize,
+    /// The exact window reports the web area itself as focused.
+    page_focused: bool,
 }
 pub(crate) struct EditorScope {
     _element: core_foundation::string::CFString,
@@ -286,6 +288,7 @@ impl EditorScope {
                 web_area: None,
                 press: None,
                 presses: 0,
+                page_focused: false,
             });
         });
         Self { _element: element }
@@ -314,6 +317,11 @@ impl EditorScope {
     /// Offer AXPress on the editor; `focuses` says whether a press gives it focus.
     pub fn press(&self, focuses: bool) {
         EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().press = Some(focuses));
+    }
+
+    /// Report the page (the web area) as the window's focused element.
+    pub fn focus_page(&self) {
+        EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().page_focused = true);
     }
 
     pub fn presses(&self) -> usize {
@@ -351,6 +359,12 @@ pub(crate) fn focused_editor(pid: i32, wid: u32) -> Option<Option<AXUIElementRef
     );
     EDITOR.with(|slot| {
         slot.borrow().as_ref().map(|fixture| {
+            if fixture.page_focused {
+                return fixture.web_area.as_ref().map(|area| unsafe {
+                    core_foundation::base::CFRetain(area.as_concrete_TypeRef() as CFTypeRef)
+                        as AXUIElementRef
+                });
+            }
             fixture.focused.then(|| unsafe {
                 core_foundation::base::CFRetain(fixture.element as CFTypeRef) as AXUIElementRef
             })

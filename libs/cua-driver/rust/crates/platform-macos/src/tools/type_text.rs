@@ -60,9 +60,9 @@ fn def() -> &'static ToolDef {
         name: "type_text".into(),
         description:
             "Insert text at an element (element_token) or the \
-             focused element. A web page field's element_token works in the background: the \
-             field is focused and gets key events. For Electron fields pass x,y screenshot \
-             pixels: it clicks there for real focus, then types. No special keys (use \
+             focused element. A web page field works in the background by element_token or \
+             x,y: the field is focused and gets key events. For Electron fields pass x,y \
+             screenshot pixels: it clicks there for real focus, then types. No special keys (use \
              press_key). If unverifiable, re-read before retrying to avoid duplicate text. \
              Details: skill://cua-driver/MACOS.md"
             .into(),
@@ -3464,6 +3464,31 @@ mod tests {
             assert_eq!(fixture.presses(), presses, "{case}");
             assert_eq!(fixture.value(), "", "{case}");
         }
+    }
+
+    /// Untargeted typing into a page: a focused page field is addressed (and
+    /// so gets the focus proof), a page with no field focused gets no keys, and
+    /// a native field keeps its own route.
+    #[test]
+    fn untargeted_typing_addresses_the_focused_page_field() {
+        use crate::ax::bindings::test_support::EditorScope;
+        let fixture = EditorScope::install("AXTextField", None, || {});
+        fixture.web();
+        match focused_web_field(-9876, 42) {
+            FocusedWebField::Field(field) => assert_eq!(field.as_ptr(), fixture.element_ptr()),
+            _ => panic!("a focused page field is addressed"),
+        }
+        fixture.focus_page();
+        assert!(matches!(focused_web_field(-9876, 42), FocusedWebField::PageOnly));
+        drop(fixture);
+        let native = EditorScope::install("AXTextField", None, || {});
+        assert!(matches!(focused_web_field(-9876, 42), FocusedWebField::Other));
+        let hit = native.element_ptr() as AXUIElementRef;
+        assert!(web_text_field_at(-9876, hit, 42).is_none(), "a native field is not a page field");
+        let result = web_page_has_no_focused_field_result();
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "web_page_has_no_focused_field");
+        assert_eq!(data["delivered_chars"], 0);
     }
 
     /// Safari keys that read back: no px or browser-tool advice (neither
