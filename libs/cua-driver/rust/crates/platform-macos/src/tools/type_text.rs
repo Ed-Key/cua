@@ -530,22 +530,7 @@ impl Tool for TypeTextTool {
                 return catalyst_text_needs_focus_result(pid, window_id);
             }
             Ok(Err(error)) if error.downcast_ref::<WebFieldNotFocused>().is_some() => {
-                // The retry names the caller's own target: its element_token, or
-                // its x,y on the window.
-                let mut target = match args.opt_str("element_token") {
-                    Some(token) => serde_json::json!({ "element_token": token }),
-                    None => match (px, py, window_id) {
-                        (Some(x), Some(y), Some(wid)) => {
-                            serde_json::json!({ "pid": pid, "window_id": wid, "x": x, "y": y })
-                        }
-                        _ => Value::Null,
-                    },
-                };
-                // The caller's pacing stays: a long text at delay 0 fits the
-                // synthesis budget that the 30 ms default would exceed.
-                if let (Some(object), Some(delay)) = (target.as_object_mut(), args.get("delay_ms")) {
-                    object.insert("delay_ms".into(), delay.clone());
-                }
+                let target = retry_target(&args, pid, px, py, window_id);
                 return web_field_not_focused_result(
                     target,
                     &text,
@@ -1203,6 +1188,23 @@ fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolRes
 
 /// An addressed web page field that did not take focus, refused before any key.
 const WEB_FIELD_NOT_FOCUSED: &str = "web_field_not_focused";
+
+/// The caller's own target for the refusal's retry: its element_token, or its
+/// x,y on the window, with its delay_ms (a long text at delay 0 fits the
+/// synthesis budget that the 30 ms default would exceed). Null without either.
+fn retry_target(args: &Value, pid: i32, px: Option<f64>, py: Option<f64>, window_id: Option<u32>) -> Value {
+    let mut target = match args.get("element_token").and_then(Value::as_str) {
+        Some(token) => serde_json::json!({ "element_token": token }),
+        None => match (px, py, window_id) {
+            (Some(x), Some(y), Some(wid)) => serde_json::json!({ "pid": pid, "window_id": wid, "x": x, "y": y }),
+            _ => Value::Null,
+        },
+    };
+    if let (Some(object), Some(delay)) = (target.as_object_mut(), args.get("delay_ms")) {
+        object.insert("delay_ms".into(), delay.clone());
+    }
+    target
+}
 
 fn web_field_not_focused_result(
     target: Value,
@@ -3459,6 +3461,21 @@ mod tests {
         let data = result.structured_content.as_ref().unwrap();
         assert!(data.get("next_call").is_none(), "{data}");
         assert!(summary_of(&result).contains("include_screenshot:true"));
+    }
+
+    #[test]
+    fn the_retry_target_is_the_callers_own_target_and_pacing() {
+        use serde_json::json;
+        assert_eq!(
+            retry_target(&json!({"element_token": "s1:2", "delay_ms": 0}), 7, None, None, Some(9)),
+            json!({"element_token": "s1:2", "delay_ms": 0})
+        );
+        assert_eq!(retry_target(&json!({"element_token": "s1:2"}), 7, None, None, Some(9)), json!({"element_token": "s1:2"}));
+        assert_eq!(
+            retry_target(&json!({"delay_ms": 5}), 7, Some(10.0), Some(20.0), Some(9)),
+            json!({"pid": 7, "window_id": 9, "x": 10.0, "y": 20.0, "delay_ms": 5})
+        );
+        assert_eq!(retry_target(&json!({"delay_ms": 5}), 7, None, None, Some(9)), Value::Null);
     }
 
     /// The key rung itself refuses an addressed web field without focus,
