@@ -17,7 +17,8 @@
 //!   annotated point (where each event already names the process it will be
 //!   delivered to), and refuses, sending nothing, when that tap cannot run;
 //! - before every press, requires WindowServer's front process to be the
-//!   target (or the owner of its window), with a bounded wait for the first
+//!   target (or the owner of its window, or the view service hosting its
+//!   focused control, such as a Save panel's), with a bounded wait for the first
 //!   one, and stops once any press went astray, so no partial chord follows;
 //! - tags the event with this scope's nonce and whether it presses or
 //!   releases.
@@ -90,9 +91,11 @@ thread_local! {
 struct Ledger {
     nonce: i64,
     own_pid: i64,
-    /// The target pid and its window's owner (the same process unless the
-    /// window belongs to a helper process, read before the first key).
-    accept: [AtomicI32; 2],
+    /// The target pid, its window's owner (the same process unless the
+    /// window belongs to a helper process) and the view service hosting the
+    /// window's focused control (an Open or Save panel), read before the
+    /// first key.
+    accept: [AtomicI32; 3],
     /// Keys whose press was delivered, and the process that got it.
     held: Mutex<Vec<(i64, i32)>>,
     posted: AtomicUsize,
@@ -107,7 +110,7 @@ impl Ledger {
         Ledger {
             nonce,
             own_pid,
-            accept: [AtomicI32::new(target), AtomicI32::new(0)],
+            accept: [AtomicI32::new(target), AtomicI32::new(0), AtomicI32::new(0)],
             held: Mutex::new(Vec::new()),
             posted: AtomicUsize::new(0),
             routed: AtomicUsize::new(0),
@@ -363,6 +366,11 @@ impl Recipient {
                 if ledger.posted.load(Ordering::SeqCst) == 0 {
                     if let Some(window) = crate::windows::window_info_by_id(self.window_id) {
                         ledger.accept[1].store(window.pid, Ordering::SeqCst);
+                    }
+                    if let Some(service) =
+                        crate::ax::keyboard_target::hosted_view_service(self.pid, self.window_id)
+                    {
+                        ledger.accept[2].store(service, Ordering::SeqCst);
                     }
                     self.await_front(FRONT_WAIT)?;
                 } else {
