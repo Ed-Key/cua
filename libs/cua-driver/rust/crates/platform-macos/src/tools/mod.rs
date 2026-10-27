@@ -600,7 +600,11 @@ async fn focused_element_holds_point(
             let Some(focused) = crate::ax::bindings::focused_element_of_pid(pid) else {
                 return false;
             };
-            let rect = crate::ax::bindings::element_screen_rect(focused);
+            // A focused web page (nothing in it focused) spans every point of
+            // the page and is no field: it never holds the requested one.
+            let page = crate::ax::bindings::copy_string_attr(focused, "AXRole").as_deref()
+                == Some("AXWebArea");
+            let rect = crate::ax::bindings::element_screen_rect(focused).filter(|_| !page);
             let focused_window = if require_window {
                 crate::ax::exact_target::element_window_id(focused)
             } else {
