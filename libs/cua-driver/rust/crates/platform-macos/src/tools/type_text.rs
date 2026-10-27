@@ -337,7 +337,7 @@ impl Tool for TypeTextTool {
         // escalates AX → CGEvent and lands once focused). Reuses ClickTool's exact
         // coordinate translation + delivery_mode, so it lands on the same pixel a
         // px-click would.
-        let used_pixel_focus = px.is_some() && py.is_some();
+        let mut px_web_field: Option<crate::ax::snapshot::RetainedElement> = None;
         if let (Some(cx), Some(cy)) = (px, py) {
             // The px form has no exact element for a semantic-only write; when
             // the keyboard rung is refused, refuse before the focus click too.
@@ -349,6 +349,25 @@ impl Tool for TypeTextTool {
                 .get("from_zoom")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // From behind, a web page text field at the point is addressed
+            // like its element_token: the key rung focuses it, proves the
+            // focus and types (a pixel focus alone does not reach a
+            // background Safari page).
+            if let (false, false, Some(wid)) = (delivery_mode.is_foreground(), from_zoom, window_id) {
+                let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
+                    Ok(ratio) => ratio,
+                    Err(refusal) => return refusal,
+                };
+                px_web_field = tokio::task::spawn_blocking(move || {
+                    web_text_field_at_window_pixel(pid, wid, cx * ratio, cy * ratio)
+                })
+                .await
+                .ok()
+                .flatten();
+            }
+        }
+        if let (Some(cx), Some(cy), None) = (px, py, px_web_field.as_ref()) {
+            let from_zoom = args.bool_or("from_zoom", false);
             if let Err(e) = super::focus_by_pixel(
                 &self.state,
                 pid,
@@ -370,9 +389,11 @@ impl Tool for TypeTextTool {
             // element_index stays None → the type path below writes to the now-
             // focused element via the CGEvent (key_events) rung.
         }
+        let used_pixel_focus = px.is_some() && py.is_some() && px_web_field.is_none();
         let element_ptr = element_guard
             .as_ref()
-            .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
+            .map(|(g, idx)| (g.as_ptr(), Some(*idx)))
+            .or_else(|| px_web_field.as_ref().map(|g| (g.as_ptr(), None)));
 
         let electron_background_ax_unsafe = element_ptr.is_some()
             && crate::browser::electron_js::ElectronJs::is_electron(pid)
@@ -446,7 +467,7 @@ impl Tool for TypeTextTool {
         let is_terminal_target = crate::terminal::is_terminal_pid(pid);
 
         let blocking_policy = keyboard_policy.clone();
-        let native_guard = element_guard.clone();
+        let native_guard = (element_guard.clone(), px_web_field.clone());
         let delivery_lease = _mutation_lease.clone();
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
@@ -2464,6 +2485,29 @@ pub(super) fn web_text_field_at(
         }
         CFRelease(current as CFTypeRef);
         None
+    }
+}
+
+/// The web page text field under window pixel `(x, y)` (native capture
+/// pixels) of `window_id`, retained, when the hit belongs to that window.
+fn web_text_field_at_window_pixel(
+    pid: i32,
+    window_id: u32,
+    x: f64,
+    y: f64,
+) -> Option<crate::ax::snapshot::RetainedElement> {
+    let frame = super::px_frame::resolve_window_px_frame(window_id).ok()?;
+    let (screen_x, screen_y, _, _) = frame.to_screen(x, y);
+    unsafe {
+        let hit = crate::ax::bindings::element_at_screen_position(pid, screen_x, screen_y)?;
+        let field = (crate::ax::exact_target::element_window_id(hit) == Some(window_id))
+            .then(|| web_text_field_at(pid, hit, window_id))
+            .flatten();
+        CFRelease(hit as CFTypeRef);
+        let field = field?;
+        let retained = crate::ax::snapshot::RetainedElement::retain(field as usize);
+        CFRelease(field as CFTypeRef);
+        Some(retained)
     }
 }
 
