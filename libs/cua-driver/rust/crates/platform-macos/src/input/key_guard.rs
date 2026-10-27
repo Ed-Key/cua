@@ -62,8 +62,9 @@ const FRONT_WAIT: Duration = Duration::from_millis(400);
 const FRONT_POLL: Duration = Duration::from_millis(10);
 /// How long the hand-back waits for posted keys to be routed.
 const SETTLE_TIMEOUT: Duration = Duration::from_millis(1000);
-/// How long the tap outlives its scope for keys still on their way.
-const LATE_KEY_GUARD: Duration = Duration::from_secs(5);
+/// How long the tap outlives its scope for keys still on their way (keys
+/// are routed within milliseconds; this bounds a stalled WindowServer).
+const LATE_KEY_GUARD: Duration = Duration::from_secs(30);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -129,11 +130,6 @@ impl Ledger {
         self.held().iter().rev().find(|(code, _)| *code == keycode).map(|(_, pid)| *pid)
     }
 
-    fn went_astray(&self, to: i32) {
-        self.astray_to.store(to, Ordering::SeqCst);
-        self.astray.fetch_add(1, Ordering::SeqCst);
-    }
-
     /// The tap's decision for one event.
     fn decide(&self, source: i64, user_data: i64, keycode: i64, target: i32) -> Decision {
         if source != self.own_pid || user_data & !RELEASE_BIT != self.nonce {
@@ -141,11 +137,19 @@ impl Ledger {
         }
         self.routed.fetch_add(1, Ordering::SeqCst);
         if user_data & RELEASE_BIT == 0 {
-            if self.accepts(target) {
+            // Once a press was withheld, the chord is over: a later press
+            // (queued before the first was routed) is withheld wherever it
+            // goes, so the target never gets part of the chord.
+            if self.astray.load(Ordering::SeqCst) == 0 && self.accepts(target) {
                 self.held().push((keycode, target));
                 return Decision::Pass;
             }
-            self.went_astray(target);
+            // A latched press bound for the target keeps the first stray
+            // process as the one named.
+            if !self.accepts(target) {
+                self.astray_to.store(target, Ordering::SeqCst);
+            }
+            self.astray.fetch_add(1, Ordering::SeqCst);
             return Decision::Withhold;
         }
         let holder = {
@@ -278,7 +282,9 @@ impl KeyScope {
             std::thread::sleep(Duration::from_millis(2));
         }
         let routed = ledger.routed.load(Ordering::SeqCst);
-        if routed < posted {
+        // A tap lost meanwhile cannot vouch for what was routed: the target
+        // stays in front so a key still queued reaches it.
+        if routed < posted || ledger.lost.load(Ordering::SeqCst) {
             return Err(KeyRefusal::Unsettled { target: self.recipient.pid, posted, routed });
         }
         if ledger.astray.load(Ordering::SeqCst) > 0 {
@@ -463,6 +469,18 @@ mod tests {
         assert_eq!(l.astray.load(Ordering::SeqCst), 1);
         assert_eq!(l.astray_to.load(Ordering::SeqCst), 918);
         assert!(l.held().is_empty());
+    }
+
+    /// Cmd down was withheld (TextEdit in front), then Safari came back
+    /// before A down was routed: A must not reach Safari without its Cmd.
+    #[test]
+    fn after_a_withheld_press_no_later_press_reaches_the_target() {
+        let l = ledger(716, 716);
+        assert_eq!(l.decide(500, PRESS, 55, 918), Decision::Withhold, "Cmd down");
+        assert_eq!(l.decide(500, PRESS, 0, 716), Decision::Withhold, "A down");
+        assert_eq!(l.decide(500, RELEASE, 0, 716), Decision::Pass, "A up: harmless at the target");
+        assert!(l.held().is_empty());
+        assert_eq!(l.astray_to.load(Ordering::SeqCst), 918, "the stray app stays named");
     }
 
     /// A modifier press routed elsewhere is withheld, not given to the
