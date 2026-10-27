@@ -182,7 +182,9 @@ pub(super) fn copy_element_attr(
         return Some(parent);
     }
     if let Some(parent) = with_editor(element, |fixture| {
-        assert_eq!(attr, "AXParent");
+        if attr != "AXParent" {
+            return None; // AXEditableAncestor: the fake editor is not in an editable region
+        }
         fixture.content_group.as_ref().or(fixture.web_area.as_ref()).map(|group| unsafe {
             core_foundation::base::CFRetain(group.as_concrete_TypeRef() as CFTypeRef)
                 as AXUIElementRef

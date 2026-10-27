@@ -530,8 +530,19 @@ impl Tool for TypeTextTool {
                 return catalyst_text_needs_focus_result(pid, window_id);
             }
             Ok(Err(error)) if error.downcast_ref::<WebFieldNotFocused>().is_some() => {
+                // The retry names the caller's own target: its element_token, or
+                // its x,y on the window.
+                let target = match args.opt_str("element_token") {
+                    Some(token) => serde_json::json!({ "element_token": token }),
+                    None => match (px, py, window_id) {
+                        (Some(x), Some(y), Some(wid)) => {
+                            serde_json::json!({ "pid": pid, "window_id": wid, "x": x, "y": y })
+                        }
+                        _ => Value::Null,
+                    },
+                };
                 return web_field_not_focused_result(
-                    args.opt_str("element_token").as_deref(),
+                    target,
                     &text,
                     args.opt_str("session").as_deref(),
                     delivery_mode.is_foreground(),
@@ -1189,7 +1200,7 @@ fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolRes
 const WEB_FIELD_NOT_FOCUSED: &str = "web_field_not_focused";
 
 fn web_field_not_focused_result(
-    element_token: Option<&str>,
+    target: Value,
     text: &str,
     session: Option<&str>,
     foreground: bool,
@@ -1214,9 +1225,10 @@ fn web_field_not_focused_result(
         "delivered_chars": 0,
         "reason": reason,
     });
-    if let (Some(token), false) = (element_token, foreground) {
-        let mut arguments =
-            serde_json::json!({ "element_token": token, "text": text, "delivery_mode": "foreground" });
+    if let (Value::Object(target), false) = (target, foreground) {
+        let mut arguments = Value::Object(target);
+        arguments["text"] = serde_json::json!(text);
+        arguments["delivery_mode"] = serde_json::json!("foreground");
         if let Some(session) = session {
             arguments["session"] = serde_json::json!(session);
         }
@@ -2507,7 +2519,8 @@ pub(super) fn web_text_field_at(
 enum FocusedWebField {
     /// A web page text field (retained) holds the window's focus.
     Field(crate::ax::snapshot::RetainedElement),
-    /// The page itself holds focus: no field in it does.
+    /// No text field in the page holds focus: the page itself, or a
+    /// control such as a link or button.
     PageOnly,
     /// Not web content, or no readable focus.
     Other,
@@ -2522,10 +2535,22 @@ fn focused_web_field(pid: i32, window_id: u32) -> FocusedWebField {
             return FocusedWebField::Other;
         };
         let role = copy_string_attr(focused, "AXRole").unwrap_or_default();
-        let outcome = if role == "AXWebArea"
-            && !crate::browser::electron_js::ElectronJs::is_electron(pid)
-        {
+        let electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
+        let outcome = if role == "AXWebArea" && !electron {
             FocusedWebField::PageOnly
+        } else if !is_text_entry_role(&role)
+            && !electron
+            && target_in_web_area(pid, Some((focused as usize, None)), Some(window_id))
+        {
+            // A focused link or button takes keys as shortcuts too; an element
+            // inside an editable region (a rich editor's own node) is text.
+            match crate::ax::bindings::copy_element_attr(focused, "AXEditableAncestor") {
+                Some(editable) => {
+                    CFRelease(editable as CFTypeRef);
+                    FocusedWebField::Other
+                }
+                None => FocusedWebField::PageOnly,
+            }
         } else if is_text_entry_role(&role) {
             match web_text_field_at(pid, focused, window_id) {
                 Some(field) => {
@@ -2546,8 +2571,9 @@ fn focused_web_field(pid: i32, window_id: u32) -> FocusedWebField {
 const WEB_PAGE_HAS_NO_FOCUSED_FIELD: &str = "web_page_has_no_focused_field";
 
 fn web_page_has_no_focused_field_result() -> ToolResult {
-    let reason = "No field in this web page has keyboard focus, so typed keys would reach the \
-                  page itself, where a key can be a shortcut. No key was sent. Next: type_text \
+    let reason = "No text field in this web page has keyboard focus (the page itself or a \
+                  control such as a link has it), so typed keys would act as the page's \
+                  shortcuts. No key was sent. Next: type_text \
                   with the field's element_token (or x,y on the field).";
     ToolResult::error(format!("type_text refused ({WEB_PAGE_HAS_NO_FOCUSED_FIELD}): {reason}"))
         .with_structured(serde_json::json!({
@@ -3392,8 +3418,12 @@ mod tests {
 
     #[test]
     fn the_web_focus_refusal_names_the_foreground_call() {
-        let result =
-            web_field_not_focused_result(Some("s00000003:9"), "dana@example.com", Some("w1"), false);
+        let result = web_field_not_focused_result(
+            serde_json::json!({ "element_token": "s00000003:9" }),
+            "dana@example.com",
+            Some("w1"),
+            false,
+        );
         assert_eq!(result.is_error, Some(true));
         let data = result.structured_content.as_ref().unwrap();
         assert_eq!(data["code"], "web_field_not_focused");
@@ -3414,7 +3444,12 @@ mod tests {
         let text = summary_of(&result);
         assert!(text.contains("no key was sent"), "{text}");
         // Refused in front too: no foreground call to offer, the pixel route instead.
-        let result = web_field_not_focused_result(Some("s00000003:9"), "x", None, true);
+        let result = web_field_not_focused_result(
+            serde_json::json!({ "element_token": "s00000003:9" }),
+            "x",
+            None,
+            true,
+        );
         let data = result.structured_content.as_ref().unwrap();
         assert!(data.get("next_call").is_none(), "{data}");
         assert!(summary_of(&result).contains("include_screenshot:true"));
@@ -3481,6 +3516,11 @@ mod tests {
         fixture.focus_page();
         assert!(matches!(focused_web_field(-9876, 42), FocusedWebField::PageOnly));
         drop(fixture);
+        // A focused link or button in a page: its keys would be shortcuts.
+        let button = EditorScope::install("AXButton", None, || {});
+        button.web();
+        assert!(matches!(focused_web_field(-9876, 42), FocusedWebField::PageOnly));
+        drop(button);
         let native = EditorScope::install("AXTextField", None, || {});
         assert!(matches!(focused_web_field(-9876, 42), FocusedWebField::Other));
         let hit = native.element_ptr() as AXUIElementRef;
