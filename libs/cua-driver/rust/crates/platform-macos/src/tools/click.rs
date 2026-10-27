@@ -291,8 +291,39 @@ fn settled_value(
 fn hit_test_delivers_via_ax(
     focus_only: bool,
     ancestry: impl FnOnce() -> crate::input::ax_actions::WebAncestry,
+    role: &str,
+    value: impl FnOnce() -> Option<String>,
 ) -> bool {
-    focus_only || ancestry() == crate::input::ax_actions::WebAncestry::Outside
+    focus_only
+        || ancestry() == crate::input::ax_actions::WebAncestry::Outside
+        || opens_native_menu(role, value)
+}
+
+/// A page's own select (an AXPopUpButton that reads its chosen option): its
+/// menu is a native window, which a pointer click from behind raised over the
+/// front app twice and left the choice unchanged; it keeps its AX press, and
+/// set_value is the tool that chooses an option. A menu button built from
+/// page elements (aria-haspopup) reads no value and takes the pointer click.
+fn opens_native_menu(role: &str, value: impl FnOnce() -> Option<String>) -> bool {
+    role == "AXPopUpButton" && value().is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Whether a background plain click on an element token is a pointer click
+/// at its centre instead of its AX action, as native Computer Use clicks web
+/// content: a page element (inside an AXWebArea, or not proven outside one)
+/// outside Electron. An AX press runs only the page's click handler (fix
+/// batch 3 fixture: a menu that opens on pointerdown stayed shut, 0 of 2);
+/// a pointer click there runs what a click runs. Text fields keep their
+/// focus route (decided by the caller) and a page's select its press.
+fn page_element_takes_pointer(
+    ancestry: impl FnOnce() -> crate::input::ax_actions::WebAncestry,
+    electron: impl FnOnce() -> bool,
+    role: &str,
+    value: impl FnOnce() -> Option<String>,
+) -> bool {
+    ancestry() != crate::input::ax_actions::WebAncestry::Outside
+        && !electron()
+        && !opens_native_menu(role, value)
 }
 
 fn pixel_activation_policy(
@@ -882,6 +913,7 @@ impl Tool for ClickTool {
             if ax_action == "AXPress" {
                 let dispatch_guard = element_guard.clone();
                 let has_modifiers = !modifiers.is_empty();
+                let background = !delivery_mode.is_foreground();
                 let decided = crate::background_mutation::spawn_blocking(move || {
                     let ptr = dispatch_guard.as_ptr();
                     let element = ptr as AXUIElementRef;
@@ -901,12 +933,58 @@ impl Tool for ClickTool {
                         .find(|name| !name.trim().is_empty())
                         .unwrap_or_default();
                     let dispatch = click_dispatch("AXPress", advertised.as_deref(), own_fallback);
-                    (dispatch, format!("[{idx}] {role} \"{title}\""), advertised.unwrap_or_default())
+                    // A background plain click on a page element is a pointer
+                    // click at its centre when that point reaches it; else the
+                    // AX action stands (one delivery either way).
+                    let page_pointer = background
+                        && !has_modifiers
+                        && !own_fallback
+                        && matches!(dispatch, ClickDispatch::Ax(_))
+                        && page_element_takes_pointer(
+                            || crate::input::ax_actions::web_ancestry_of_element(ptr),
+                            || crate::browser::electron_js::ElectronJs::is_electron(pid),
+                            &role,
+                            || unsafe { copy_string_attr(element, "AXValue") },
+                        )
+                        && center.is_some_and(|point| point_reaches_element(pid, wid, element, point));
+                    (dispatch, format!("[{idx}] {role} \"{title}\""), advertised.unwrap_or_default(), page_pointer)
                 })
                 .await;
+                // The pointer rung's own admission (a hidden window refuses
+                // it): when it refuses, the page element keeps its AX action.
+                let page_pointer = match (&decided, _mutation_lease.as_ref()) {
+                    (Ok((_, _, _, true)), Some(lease)) => lease
+                        .gate_again(
+                            wid,
+                            Some(element_ptr),
+                            cua_driver_core::background_input::BackgroundAction::WindowPointer,
+                        )
+                        .await
+                        .is_ok(),
+                    _ => false,
+                };
                 match decided {
-                    Ok((ClickDispatch::Ax(action), _, _)) => ax_action = action,
-                    Ok((ClickDispatch::Pointer, label, advertised)) => {
+                    Ok((ClickDispatch::Ax(_), label, _, true)) if page_pointer => {
+                        let why = format!(
+                            "{label} is a page element: a click there runs what the page listens for \
+                             (an AX press runs only its click handler)"
+                        );
+                        return self
+                            .click_element_by_pointer(
+                                &args,
+                                (pid, wid),
+                                (idx, press_row.clone()),
+                                element_guard.clone(),
+                                center,
+                                &why,
+                                false,
+                                _mutation_lease.as_ref(),
+                                true,
+                            )
+                            .await;
+                    }
+                    Ok((ClickDispatch::Ax(action), _, _, _)) => ax_action = action,
+                    Ok((ClickDispatch::Pointer, label, advertised, _)) => {
                         let actions = advertised
                             .into_iter()
                             .map(crate::ax::tree::display_action_name)
@@ -926,6 +1004,7 @@ impl Tool for ClickTool {
                                 &why,
                                 delivery_mode.is_foreground(),
                                 _mutation_lease.as_ref(),
+                                false,
                             )
                             .await;
                     }
@@ -1468,9 +1547,13 @@ impl Tool for ClickTool {
                                 CFRelease(element as _);
                                 return Ok(PixelHit::Missed);
                             }
-                            if !hit_test_delivers_via_ax(focus_only, || {
-                                crate::input::ax_actions::web_ancestry_of_element(element as usize)
-                            }) {
+                            let hit_role = copy_string_attr(element, "AXRole").unwrap_or_default();
+                            if !hit_test_delivers_via_ax(
+                                focus_only,
+                                || crate::input::ax_actions::web_ancestry_of_element(element as usize),
+                                &hit_role,
+                                || copy_string_attr(element, "AXValue"),
+                            ) {
                                 CFRelease(element as _);
                                 return Ok(PixelHit::Missed);
                             }
@@ -1856,6 +1939,7 @@ impl ClickTool {
         why: &str,
         foreground: bool,
         lease: Option<&super::BackgroundMutationLease>,
+        reach_proven: bool,
     ) -> ToolResult {
         let refuse = |detail: String| {
             ToolResult::error(format!(
@@ -1889,7 +1973,8 @@ impl ClickTool {
             let ptr = element.as_ptr();
             ensure_names_row(ptr as AXUIElementRef, idx, snapshot_row.as_deref())
                 .and_then(|()| crate::input::ax_actions::ensure_ax_action_enabled(ptr, "AXPress"))
-                .map(|()| point_reaches_element(pid, wid, ptr as AXUIElementRef, (cx, cy)))
+                // The caller's settled hit test just now counts.
+                .map(|()| reach_proven || point_reaches_element(pid, wid, ptr as AXUIElementRef, (cx, cy)))
         })
         .await;
         match checked {
@@ -2536,7 +2621,7 @@ mod settled_hit_tests {
 
 #[cfg(test)]
 mod click_dispatch_tests {
-    use super::{click_dispatch, hit_test_delivers_via_ax, ClickDispatch};
+    use super::{click_dispatch, hit_test_delivers_via_ax, page_element_takes_pointer, ClickDispatch};
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| name.to_string()).collect()
@@ -2554,10 +2639,30 @@ mod click_dispatch_tests {
     #[test]
     fn a_background_pixel_click_on_a_page_is_a_pointer_click() {
         use crate::input::ax_actions::WebAncestry;
-        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Inside));
-        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Unknown));
-        assert!(hit_test_delivers_via_ax(false, || WebAncestry::Outside));
-        assert!(hit_test_delivers_via_ax(true, || WebAncestry::Inside));
+        let none = || None;
+        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Inside, "AXImage", none));
+        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Unknown, "AXButton", none));
+        assert!(hit_test_delivers_via_ax(false, || WebAncestry::Outside, "AXButton", none));
+        assert!(hit_test_delivers_via_ax(true, || WebAncestry::Inside, "AXTextField", none));
+        // A page's select keeps its press; a page menu button does not.
+        let small = || Some("Small".to_string());
+        assert!(hit_test_delivers_via_ax(false, || WebAncestry::Inside, "AXPopUpButton", small));
+        assert!(!hit_test_delivers_via_ax(false, || WebAncestry::Inside, "AXPopUpButton", none));
+    }
+
+    /// Fix batch 3: a background element click on a page is a pointer click
+    /// (the pilot's Linear assignee AXPress opened nothing), except in
+    /// Electron, outside web content, and on a page's select.
+    #[test]
+    fn a_page_element_token_click_is_a_pointer_click() {
+        use crate::input::ax_actions::WebAncestry;
+        let none = || None;
+        let small = || Some("Small".to_string());
+        assert!(page_element_takes_pointer(|| WebAncestry::Inside, || false, "AXPopUpButton", none));
+        assert!(page_element_takes_pointer(|| WebAncestry::Unknown, || false, "AXImage", none));
+        assert!(!page_element_takes_pointer(|| WebAncestry::Outside, || false, "AXButton", none));
+        assert!(!page_element_takes_pointer(|| WebAncestry::Inside, || true, "AXButton", none));
+        assert!(!page_element_takes_pointer(|| WebAncestry::Inside, || false, "AXPopUpButton", small));
     }
 
     #[test]
