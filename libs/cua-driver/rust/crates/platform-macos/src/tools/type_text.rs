@@ -2641,17 +2641,7 @@ fn settle_web_area_focus(pid: i32, window_id: u32) {
 /// focus write: a page moves focus from its own event loop, not within the
 /// write.
 fn await_addressed_focus(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
-    await_addressed_focus_within(pid, element, window_id, WEB_FOCUS_TIMEOUT)
-}
-
-/// [`await_addressed_focus`] with its own bound.
-pub(super) fn await_addressed_focus_within(
-    pid: i32,
-    element: AXUIElementRef,
-    window_id: Option<u32>,
-    timeout: std::time::Duration,
-) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + WEB_FOCUS_TIMEOUT;
     loop {
         if addressed_element_has_focus(pid, element, window_id) {
             return true;

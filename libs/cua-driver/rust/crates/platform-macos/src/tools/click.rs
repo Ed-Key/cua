@@ -2044,12 +2044,6 @@ fn is_text_entry_role(role: &str) -> bool {
     )
 }
 
-/// How long a page text field's window may take to report the focus a click
-/// gave it. The pilot's Gmail search field took longer than type_text's
-/// 250 ms (the click then wrote focus and answered an error while the field
-/// did take focus); a click has no tighter budget to fit inside.
-const WEB_FIELD_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
-
 /// An `AXFocused` write can be accepted and then clobbered when AppKit
 /// installs the window's remembered first responder, so the write is read back
 /// rather than trusted.
@@ -2206,49 +2200,6 @@ fn perform_ax_click(
                 selection_pixel,
                 foreground,
             );
-        }
-    }
-
-    // A background click on a page text field (outside Electron) presses it
-    // once, then proves focus through its window's own focused element and
-    // writes AXFocused when the press left focus elsewhere. A press alone
-    // left a background Safari page's textarea unfocused (fix batch 1's
-    // probe, 6 of 6).
-    if ax_action == "AXPress" && modifiers.is_empty() && !foreground && is_text_entry_role(&role) {
-        if let Some(field) = super::type_text::web_text_field_at(pid, element, window_id) {
-            unsafe { CFRelease(field as CFTypeRef) };
-            // The click's one press first (a field's click handler runs, as
-            // before); then focus, written only when the press left it
-            // elsewhere.
-            let presses = advertised.iter().any(|action| action == "AXPress");
-            let pressed = presses
-                && unsafe { crate::ax::bindings::perform_action(element, "AXPress") }
-                    == crate::ax::bindings::kAXErrorSuccess;
-            let settled = |element| {
-                super::type_text::await_addressed_focus_within(pid, element, Some(window_id), WEB_FIELD_FOCUS_TIMEOUT)
-            };
-            let focused = (pressed && settled(element))
-                || (crate::input::ax_actions::focus_element(element_ptr).is_ok() && settled(element));
-            if !focused {
-                // An error, so a step list stops before typing into whichever
-                // field does have focus; the press may still have acted.
-                anyhow::bail!(
-                    "[{idx}] {role} \"{title}\" did not take keyboard focus: {}its window still \
-                     reports another element focused after a focus write. Read the window before \
-                     typing or clicking again.",
-                    if presses { "its press was sent (it may have acted), but " } else { "" }
-                );
-            }
-            return Ok((
-                format!(
-                    "✅ Focused [{idx}] {role} \"{title}\": the page field has keyboard focus, \
-                     confirmed through its window's focused element."
-                ),
-                false,
-                false,
-                true,
-                false,
-            ));
         }
     }
 
