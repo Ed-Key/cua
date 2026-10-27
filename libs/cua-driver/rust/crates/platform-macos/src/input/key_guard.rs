@@ -133,9 +133,8 @@ impl Ledger {
     /// The tap's decision for one event.
     fn decide(&self, source: i64, user_data: i64, keycode: i64, target: i32) -> Decision {
         if source != self.own_pid || user_data & !RELEASE_BIT != self.nonce {
-            return Decision::Pass;
+            return Decision::Foreign;
         }
-        self.routed.fetch_add(1, Ordering::SeqCst);
         if user_data & RELEASE_BIT == 0 {
             // Once a press was withheld, the chord is over: a later press
             // (queued before the first was routed) is withheld wherever it
@@ -169,6 +168,8 @@ impl Ledger {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Decision {
+    /// Not this scope's event: passed and not counted.
+    Foreign,
     Pass,
     Withhold,
     /// Withhold, and post the event to this process instead.
@@ -367,6 +368,10 @@ impl Recipient {
                 } else {
                     self.await_front(Duration::ZERO)?;
                 }
+                // The wait for the front can outlast the tap.
+                if !self.guarded(tap.as_ref()) {
+                    return Err(KeyRefusal::GuardUnavailable("its event tap stopped".into()).into());
+                }
                 event.set_integer_value_field(FIELD_USER_DATA, ledger.nonce);
             }
             KeyRole::Release => {
@@ -424,7 +429,8 @@ impl Recipient {
                     read(FIELD_KEYCODE),
                     read(FIELD_TARGET_PID) as i32,
                 );
-                match decision {
+                let tap_decision = match decision {
+                    Decision::Foreign => return TapDecision::Pass,
                     Decision::Pass => TapDecision::Pass,
                     Decision::Withhold => TapDecision::Drop,
                     Decision::GiveTo(pid) => {
@@ -432,7 +438,12 @@ impl Recipient {
                         unsafe { CGEventPostToPid(pid, event) };
                         TapDecision::Drop
                     }
-                }
+                };
+                // Counted only once its decision is carried out (a release
+                // given to its press's process is posted by now), so the
+                // hand-back that waits for this count never overtakes it.
+                ledger.routed.fetch_add(1, Ordering::SeqCst);
+                tap_decision
             },
             move || lost.lost.store(true, Ordering::SeqCst),
         )
@@ -465,7 +476,6 @@ mod tests {
         assert_eq!(l.decide(500, PRESS, 0, 918), Decision::Withhold, "A down");
         assert_eq!(l.decide(500, RELEASE, 0, 918), Decision::Withhold, "A up, never pressed");
         assert_eq!(l.decide(500, RELEASE, 55, 918), Decision::GiveTo(716), "Cmd up");
-        assert_eq!(l.routed.load(Ordering::SeqCst), 4);
         assert_eq!(l.astray.load(Ordering::SeqCst), 1);
         assert_eq!(l.astray_to.load(Ordering::SeqCst), 918);
         assert!(l.held().is_empty());
@@ -507,11 +517,11 @@ mod tests {
     #[test]
     fn only_this_scopes_own_events_are_judged() {
         let l = ledger(716, 716);
-        assert_eq!(l.decide(0, 0, 0, 918), Decision::Pass, "the user's key");
-        assert_eq!(l.decide(500, 0, 0, 918), Decision::Pass, "an untagged cua key");
-        assert_eq!(l.decide(500, PRESS + 2, 0, 918), Decision::Pass, "another scope's key");
-        assert_eq!(l.decide(501, PRESS, 0, 918), Decision::Pass, "another process");
-        assert_eq!(l.routed.load(Ordering::SeqCst), 0);
+        assert_eq!(l.decide(0, 0, 0, 918), Decision::Foreign, "the user's key");
+        assert_eq!(l.decide(500, 0, 0, 918), Decision::Foreign, "an untagged cua key");
+        assert_eq!(l.decide(500, PRESS + 2, 0, 918), Decision::Foreign, "another scope's key");
+        assert_eq!(l.decide(501, PRESS, 0, 918), Decision::Foreign, "another process");
+        assert_eq!(l.astray.load(Ordering::SeqCst), 0);
     }
 
     #[test]
