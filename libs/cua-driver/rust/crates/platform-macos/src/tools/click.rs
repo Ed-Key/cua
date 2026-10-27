@@ -2214,36 +2214,33 @@ fn perform_ax_click(
             // The click's one press first (a field's click handler runs, as
             // before); then focus, written only when the press left it
             // elsewhere.
-            let pressed = advertised.iter().any(|action| action == "AXPress")
+            let presses = advertised.iter().any(|action| action == "AXPress");
+            let pressed = presses
                 && unsafe { crate::ax::bindings::perform_action(element, "AXPress") }
                     == crate::ax::bindings::kAXErrorSuccess;
             let focused = (pressed && super::type_text::await_addressed_focus(pid, element, Some(window_id)))
                 || (crate::input::ax_actions::focus_element(element_ptr).is_ok()
                     && super::type_text::await_addressed_focus(pid, element, Some(window_id)));
-            return Ok(if focused {
-                (
-                    format!(
-                        "✅ Focused [{idx}] {role} \"{title}\": the page field has keyboard focus, \
-                         confirmed through its window's focused element."
-                    ),
-                    false,
-                    false,
-                    true,
-                    false,
-                )
-            } else {
-                (
-                    format!(
-                        "📨 Clicked [{idx}] {role} \"{title}\" (its press, then a focus write), but \
-                         its window still reports another element focused; read the window before \
-                         typing."
-                    ),
-                    false,
-                    false,
-                    false,
-                    false,
-                )
-            });
+            if !focused {
+                // An error, so a step list stops before typing into whichever
+                // field does have focus; the press may still have acted.
+                anyhow::bail!(
+                    "[{idx}] {role} \"{title}\" did not take keyboard focus: {}its window still \
+                     reports another element focused after a focus write. Read the window before \
+                     typing or clicking again.",
+                    if presses { "its press was sent (it may have acted), but " } else { "" }
+                );
+            }
+            return Ok((
+                format!(
+                    "✅ Focused [{idx}] {role} \"{title}\": the page field has keyboard focus, \
+                     confirmed through its window's focused element."
+                ),
+                false,
+                false,
+                true,
+                false,
+            ));
         }
     }
 
