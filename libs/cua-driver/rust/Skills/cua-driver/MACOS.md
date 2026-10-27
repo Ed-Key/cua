@@ -625,9 +625,9 @@ that reads the text back is still `⚠️ Not confirmed:` (web content) with no
 escalation: check the page's own response (search results, a draft) instead of
 typing again. From behind, `x,y` on a page field addresses that field the same
 way, and so does an untargeted `type_text` into a page whose field has focus; an
-untargeted call into a page where no field has focus is refused with
-`code:"web_page_has_no_focused_field"` before any key, because a key on the page
-itself can be a shortcut.
+untargeted call into a page where no text field has focus (the page itself, a
+link or a button) is refused with `code:"web_page_has_no_focused_field"` before
+any key, because those keys would act as page shortcuts.
 
 ## macOS common error patterns
 
