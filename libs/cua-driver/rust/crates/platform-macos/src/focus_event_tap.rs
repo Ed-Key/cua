@@ -167,13 +167,43 @@ impl EventTap {
         if pid <= 0 {
             bail!("event tap target pid is invalid");
         }
-        let mask = event_mask(event_types)?;
         let create = create_tap().context("per-process event tap is unavailable")?;
+        Self::start_with(create, pid, format!("cua-focus-tap-{pid}"), event_types, handler, on_unavailable)
+    }
+
+    /// An active tap on the whole login session at the point where each
+    /// event has been annotated with the process it will be delivered to
+    /// (`kCGAnnotatedSessionEventTap`): a handler that drops an event there
+    /// keeps it from every application.
+    pub(crate) fn start_annotated_session(
+        event_types: &[u32],
+        handler: impl Fn(u32, RawEvent) -> TapDecision + Send + Sync + 'static,
+        on_unavailable: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        Self::start_with(
+            annotated_session_tap_create,
+            ANNOTATED_SESSION_TAP,
+            "cua-key-guard-tap".into(),
+            event_types,
+            handler,
+            on_unavailable,
+        )
+    }
+
+    fn start_with(
+        create: CreateTap,
+        pid: i32,
+        name: String,
+        event_types: &[u32],
+        handler: impl Fn(u32, RawEvent) -> TapDecision + Send + Sync + 'static,
+        on_unavailable: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self> {
+        let mask = event_mask(event_types)?;
         let (ready, receiver) = mpsc::sync_channel(1);
         let handler: Arc<Handler> = Arc::new(handler);
         let on_unavailable: Arc<Unavailable> = Arc::new(on_unavailable);
         let worker = thread::Builder::new()
-            .name(format!("cua-focus-tap-{pid}"))
+            .name(name)
             .spawn(move || {
                 let mut ready = Some(ready);
                 let result = run_worker(create, pid, mask, handler, on_unavailable, &mut ready);
@@ -224,6 +254,33 @@ impl Drop for EventTap {
     fn drop(&mut self) {
         self.close();
     }
+}
+
+/// `kCGAnnotatedSessionEventTap`.
+const ANNOTATED_SESSION_TAP: i32 = 2;
+
+/// `CGEventTapCreate` in the shape of the per-process creator: its first
+/// argument is the tap location instead of a pid.
+unsafe extern "C" fn annotated_session_tap_create(
+    location: i32,
+    place: u32,
+    options: u32,
+    mask: u64,
+    callback: Callback,
+    user_info: *mut c_void,
+) -> CFMachPortRef {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            mask: u64,
+            callback: Callback,
+            user_info: *mut c_void,
+        ) -> CFMachPortRef;
+    }
+    unsafe { CGEventTapCreate(location as u32, place, options, mask, callback, user_info) }
 }
 
 fn create_tap() -> Option<CreateTap> {
@@ -287,7 +344,7 @@ fn run_worker(
         )
     };
     if port.is_null() {
-        bail!("per-process event tap could not be installed");
+        bail!("event tap could not be installed");
     }
     let mut resources = NativeResources {
         port,
@@ -303,7 +360,7 @@ fn run_worker(
         CGEventTapEnable(port, true);
     }
     if !unsafe { CGEventTapIsEnabled(port) } {
-        bail!("per-process event tap is disabled");
+        bail!("event tap is disabled");
     }
     let startup = ready.take().expect("startup notification owned by worker");
     if startup.send(Ok(control.clone())).is_err() {

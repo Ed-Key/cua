@@ -11,6 +11,7 @@
 pub mod ax_actions;
 pub(crate) mod event_clock;
 pub mod interactive;
+pub mod key_guard;
 pub mod keyboard;
 pub mod mouse;
 pub(crate) mod native_focus_events;

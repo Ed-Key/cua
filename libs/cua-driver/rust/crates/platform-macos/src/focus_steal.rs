@@ -848,10 +848,20 @@ fn restore_focus(pid: i32, admit: &mut dyn FnMut() -> bool) {
     // A HID click cua posted that an event tap still holds would land on the
     // app restored. (The turn is not required: this undoes a theft during an
     // action, often one holding the turn.)
-    let accepted = crate::input::skylight::restore_front_pid(pid, &mut || {
-        !crate::input::mouse::click_in_flight() && admit()
-    });
+    let accepted = crate::input::skylight::restore_front_pid(pid, &mut || restore_admitted(admit));
     tracing::debug!(restore_to = pid, accepted, "WindowServer focus restoration returned");
+}
+
+/// Whether the guard may restore now. Not while a foreground action has its
+/// target in front for its input (item 38): restoring the user's app then
+/// routed the action's keys into the user's document. That action hands the
+/// front back itself once its input was routed.
+fn restore_admitted(admit: &mut dyn FnMut() -> bool) -> bool {
+    if crate::input::key_guard::foreground_input_open() {
+        tracing::debug!("focus restoration deferred to the open foreground action");
+        return false;
+    }
+    !crate::input::mouse::click_in_flight() && admit()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -864,6 +874,22 @@ fn restore_focus(pid: i32, admit: &mut dyn FnMut() -> bool) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// Item 38: a focus guard restored the user's TextEdit while a foreground
+    /// hotkey had Safari in front for its chord, and the chord's keys landed
+    /// in the user's document. While a foreground action's key scope is
+    /// open, no guard restore is admitted.
+    #[test]
+    fn no_restore_while_a_foreground_action_has_its_target_in_front() {
+        let scope = crate::input::key_guard::KeyScope::open(716, 38);
+        let mut asked = false;
+        assert!(!restore_admitted(&mut || {
+            asked = true;
+            true
+        }));
+        assert!(!asked, "the lease is not even consulted");
+        drop(scope);
+    }
 
     /// Dispatcher::add returns a handle, the entry is reachable by
     /// match, and remove() drops it.
