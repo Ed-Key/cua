@@ -532,7 +532,7 @@ impl Tool for TypeTextTool {
             Ok(Err(error)) if error.downcast_ref::<WebFieldNotFocused>().is_some() => {
                 // The retry names the caller's own target: its element_token, or
                 // its x,y on the window.
-                let target = match args.opt_str("element_token") {
+                let mut target = match args.opt_str("element_token") {
                     Some(token) => serde_json::json!({ "element_token": token }),
                     None => match (px, py, window_id) {
                         (Some(x), Some(y), Some(wid)) => {
@@ -541,6 +541,11 @@ impl Tool for TypeTextTool {
                         _ => Value::Null,
                     },
                 };
+                // The caller's pacing stays: a long text at delay 0 fits the
+                // synthesis budget that the 30 ms default would exceed.
+                if let (Some(object), Some(delay)) = (target.as_object_mut(), args.get("delay_ms")) {
+                    object.insert("delay_ms".into(), delay.clone());
+                }
                 return web_field_not_focused_result(
                     target,
                     &text,
@@ -3419,7 +3424,7 @@ mod tests {
     #[test]
     fn the_web_focus_refusal_names_the_foreground_call() {
         let result = web_field_not_focused_result(
-            serde_json::json!({ "element_token": "s00000003:9" }),
+            serde_json::json!({ "element_token": "s00000003:9", "delay_ms": 0 }),
             "dana@example.com",
             Some("w1"),
             false,
@@ -3435,6 +3440,7 @@ mod tests {
                 "tool": "type_text",
                 "arguments": {
                     "element_token": "s00000003:9",
+                    "delay_ms": 0,
                     "text": "dana@example.com",
                     "delivery_mode": "foreground",
                     "session": "w1",
