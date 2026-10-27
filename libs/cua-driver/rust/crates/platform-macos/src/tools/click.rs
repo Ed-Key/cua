@@ -2044,6 +2044,12 @@ fn is_text_entry_role(role: &str) -> bool {
     )
 }
 
+/// How long a page text field's window may take to report the focus a click
+/// gave it. The pilot's Gmail search field took longer than type_text's
+/// 250 ms (the click then wrote focus and answered an error while the field
+/// did take focus); a click has no tighter budget to fit inside.
+const WEB_FIELD_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
 /// An `AXFocused` write can be accepted and then clobbered when AppKit
 /// installs the window's remembered first responder, so the write is read back
 /// rather than trusted.
@@ -2218,9 +2224,11 @@ fn perform_ax_click(
             let pressed = presses
                 && unsafe { crate::ax::bindings::perform_action(element, "AXPress") }
                     == crate::ax::bindings::kAXErrorSuccess;
-            let focused = (pressed && super::type_text::await_addressed_focus(pid, element, Some(window_id)))
-                || (crate::input::ax_actions::focus_element(element_ptr).is_ok()
-                    && super::type_text::await_addressed_focus(pid, element, Some(window_id)));
+            let settled = |element| {
+                super::type_text::await_addressed_focus_within(pid, element, Some(window_id), WEB_FIELD_FOCUS_TIMEOUT)
+            };
+            let focused = (pressed && settled(element))
+                || (crate::input::ax_actions::focus_element(element_ptr).is_ok() && settled(element));
             if !focused {
                 // An error, so a step list stops before typing into whichever
                 // field does have focus; the press may still have acted.
