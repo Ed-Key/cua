@@ -917,31 +917,56 @@ impl Tool for ClickTool {
                         .unwrap_or_default();
                     let dispatch = click_dispatch("AXPress", advertised.as_deref(), own_fallback);
                     // A background plain click on a page element is a pointer
-                    // click at its centre when that point reaches it; else the
-                    // AX action stands (one delivery either way).
-                    let page_pointer = background
+                    // click at its centre (decided below, before any input).
+                    let page_element = background
                         && !has_modifiers
                         && !own_fallback
                         && matches!(dispatch, ClickDispatch::Ax(_))
                         && page_element_takes_pointer(
                             || crate::input::ax_actions::web_ancestry_of_element(ptr),
                             || crate::browser::electron_js::ElectronJs::is_electron(pid),
-                        )
-                        && center.is_some_and(|point| point_reaches_element(pid, wid, element, point));
-                    (dispatch, format!("[{idx}] {role} \"{title}\""), advertised.unwrap_or_default(), page_pointer)
+                        );
+                    (dispatch, format!("[{idx}] {role} \"{title}\""), advertised.unwrap_or_default(), page_element)
                 })
                 .await;
-                // The pointer rung's own admission (a hidden window refuses
-                // it): when it refuses, the page element keeps its AX action.
-                let page_pointer = match (&decided, _mutation_lease.as_ref()) {
-                    (Ok((_, _, _, true)), Some(lease)) => lease
-                        .gate_again(
-                            wid,
-                            Some(element_ptr),
-                            cua_driver_core::background_input::BackgroundAction::WindowPointer,
-                        )
-                        .await
-                        .is_ok(),
+                // The pointer rung's own admission, then the centre's settled
+                // hit test, last before dispatch. When the pointer rung is
+                // refused (a hidden window) the AX action stands only if its
+                // own admission still holds; when the centre reaches
+                // something else, the AX action stands.
+                let page_pointer = match (&decided, _mutation_lease.as_ref(), center) {
+                    (Ok((_, _, _, true)), Some(lease), Some(point)) => {
+                        match lease
+                            .gate_again(
+                                wid,
+                                Some(element_ptr),
+                                cua_driver_core::background_input::BackgroundAction::WindowPointer,
+                            )
+                            .await
+                        {
+                            Ok(()) => {
+                                let reach_guard = element_guard.clone();
+                                crate::background_mutation::spawn_blocking(move || {
+                                    point_reaches_element(pid, wid, reach_guard.as_ptr() as AXUIElementRef, point)
+                                })
+                                .await
+                                .unwrap_or(false)
+                            }
+                            Err(_) => {
+                                if let Err(refusal) = lease
+                                    .gate_again(
+                                        wid,
+                                        Some(element_ptr),
+                                        cua_driver_core::background_input::BackgroundAction::AxSemantic,
+                                    )
+                                    .await
+                                {
+                                    return refusal;
+                                }
+                                false
+                            }
+                        }
+                    }
                     _ => false,
                 };
                 match decided {
@@ -2178,16 +2203,24 @@ fn perform_ax_click(
         }
     }
 
-    // A page text field (outside Electron) takes focus the way type_text
-    // gives it: the AXFocused write, then its press only when the write left
-    // focus elsewhere, proven through its window's own focused element. A
-    // press alone left a background Safari page's textarea unfocused (fix
-    // batch 1's probe, 6 of 6).
-    if ax_action == "AXPress" && modifiers.is_empty() && is_text_entry_role(&role) {
+    // A background click on a page text field (outside Electron) presses it
+    // once, then proves focus through its window's own focused element and
+    // writes AXFocused when the press left focus elsewhere. A press alone
+    // left a background Safari page's textarea unfocused (fix batch 1's
+    // probe, 6 of 6).
+    if ax_action == "AXPress" && modifiers.is_empty() && !foreground && is_text_entry_role(&role) {
         if let Some(field) = super::type_text::web_text_field_at(pid, element, window_id) {
             unsafe { CFRelease(field as CFTypeRef) };
-            let _ = crate::input::ax_actions::focus_element(element_ptr);
-            return Ok(if super::type_text::focus_web_field(pid, element, Some(window_id)) {
+            // The click's one press first (a field's click handler runs, as
+            // before); then focus, written only when the press left it
+            // elsewhere.
+            let pressed = advertised.iter().any(|action| action == "AXPress")
+                && unsafe { crate::ax::bindings::perform_action(element, "AXPress") }
+                    == crate::ax::bindings::kAXErrorSuccess;
+            let focused = (pressed && super::type_text::await_addressed_focus(pid, element, Some(window_id)))
+                || (crate::input::ax_actions::focus_element(element_ptr).is_ok()
+                    && super::type_text::await_addressed_focus(pid, element, Some(window_id)));
+            return Ok(if focused {
                 (
                     format!(
                         "✅ Focused [{idx}] {role} \"{title}\": the page field has keyboard focus, \
@@ -2201,9 +2234,9 @@ fn perform_ax_click(
             } else {
                 (
                     format!(
-                        "📨 Asked [{idx}] {role} \"{title}\" for keyboard focus (focus write and its \
-                         press), but its window still reports another element focused; read the \
-                         window before typing."
+                        "📨 Clicked [{idx}] {role} \"{title}\" (its press, then a focus write), but \
+                         its window still reports another element focused; read the window before \
+                         typing."
                     ),
                     false,
                     false,
