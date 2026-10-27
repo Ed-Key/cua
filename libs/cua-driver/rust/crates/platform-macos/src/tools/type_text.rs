@@ -337,7 +337,7 @@ impl Tool for TypeTextTool {
         // escalates AX → CGEvent and lands once focused). Reuses ClickTool's exact
         // coordinate translation + delivery_mode, so it lands on the same pixel a
         // px-click would.
-        let mut px_web_field: Option<crate::ax::snapshot::RetainedElement> = None;
+        let mut page_field: Option<crate::ax::snapshot::RetainedElement> = None;
         if let (Some(cx), Some(cy)) = (px, py) {
             // The px form has no exact element for a semantic-only write; when
             // the keyboard rung is refused, refuse before the focus click too.
@@ -358,7 +358,7 @@ impl Tool for TypeTextTool {
                     Ok(ratio) => ratio,
                     Err(refusal) => return refusal,
                 };
-                px_web_field = tokio::task::spawn_blocking(move || {
+                page_field = tokio::task::spawn_blocking(move || {
                     web_text_field_at_window_pixel(pid, wid, cx * ratio, cy * ratio)
                 })
                 .await
@@ -366,7 +366,7 @@ impl Tool for TypeTextTool {
                 .flatten();
             }
         }
-        if let (Some(cx), Some(cy), None) = (px, py, px_web_field.as_ref()) {
+        if let (Some(cx), Some(cy), None) = (px, py, page_field.as_ref()) {
             let from_zoom = args.bool_or("from_zoom", false);
             if let Err(e) = super::focus_by_pixel(
                 &self.state,
@@ -389,11 +389,27 @@ impl Tool for TypeTextTool {
             // element_index stays None → the type path below writes to the now-
             // focused element via the CGEvent (key_events) rung.
         }
-        let used_pixel_focus = px.is_some() && py.is_some() && px_web_field.is_none();
+        // An untargeted background type_text into a page: the field the page
+        // has focused is addressed the same way, and a page with no field
+        // focused gets no keys (a key on the page itself can be a shortcut).
+        if let (None, None, None, false, Some(wid)) = (
+            element_guard.as_ref(),
+            px,
+            page_field.as_ref(),
+            delivery_mode.is_foreground(),
+            window_id,
+        ) {
+            match tokio::task::spawn_blocking(move || focused_web_field(pid, wid)).await {
+                Ok(FocusedWebField::Field(field)) => page_field = Some(field),
+                Ok(FocusedWebField::PageOnly) => return web_page_has_no_focused_field_result(),
+                _ => {}
+            }
+        }
+        let used_pixel_focus = px.is_some() && py.is_some() && page_field.is_none();
         let element_ptr = element_guard
             .as_ref()
             .map(|(g, idx)| (g.as_ptr(), Some(*idx)))
-            .or_else(|| px_web_field.as_ref().map(|g| (g.as_ptr(), None)));
+            .or_else(|| page_field.as_ref().map(|g| (g.as_ptr(), None)));
 
         let electron_background_ax_unsafe = element_ptr.is_some()
             && crate::browser::electron_js::ElectronJs::is_electron(pid)
@@ -467,7 +483,7 @@ impl Tool for TypeTextTool {
         let is_terminal_target = crate::terminal::is_terminal_pid(pid);
 
         let blocking_policy = keyboard_policy.clone();
-        let native_guard = (element_guard.clone(), px_web_field.clone());
+        let native_guard = (element_guard.clone(), page_field.clone());
         let delivery_lease = _mutation_lease.clone();
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
@@ -2486,6 +2502,61 @@ pub(super) fn web_text_field_at(
         CFRelease(current as CFTypeRef);
         None
     }
+}
+
+enum FocusedWebField {
+    /// A web page text field (retained) holds the window's focus.
+    Field(crate::ax::snapshot::RetainedElement),
+    /// The page itself holds focus: no field in it does.
+    PageOnly,
+    /// Not web content, or no readable focus.
+    Other,
+}
+
+/// The window's focused element, once a just-clicked page has reported it
+/// (see [`settle_web_area_focus`]), classified for untargeted typing.
+fn focused_web_field(pid: i32, window_id: u32) -> FocusedWebField {
+    settle_web_area_focus(pid, window_id);
+    unsafe {
+        let Some(focused) = crate::ax::exact_target::focused_element_in_window(pid, window_id) else {
+            return FocusedWebField::Other;
+        };
+        let role = copy_string_attr(focused, "AXRole").unwrap_or_default();
+        let outcome = if role == "AXWebArea"
+            && !crate::browser::electron_js::ElectronJs::is_electron(pid)
+        {
+            FocusedWebField::PageOnly
+        } else if is_text_entry_role(&role) {
+            match web_text_field_at(pid, focused, window_id) {
+                Some(field) => {
+                    let retained = crate::ax::snapshot::RetainedElement::retain(field as usize);
+                    CFRelease(field as CFTypeRef);
+                    FocusedWebField::Field(retained)
+                }
+                None => FocusedWebField::Other,
+            }
+        } else {
+            FocusedWebField::Other
+        };
+        CFRelease(focused as CFTypeRef);
+        outcome
+    }
+}
+
+const WEB_PAGE_HAS_NO_FOCUSED_FIELD: &str = "web_page_has_no_focused_field";
+
+fn web_page_has_no_focused_field_result() -> ToolResult {
+    let reason = "No field in this web page has keyboard focus, so typed keys would reach the \
+                  page itself, where a key can be a shortcut. No key was sent. Next: type_text \
+                  with the field's element_token (or x,y on the field).";
+    ToolResult::error(format!("type_text refused ({WEB_PAGE_HAS_NO_FOCUSED_FIELD}): {reason}"))
+        .with_structured(serde_json::json!({
+            "code": WEB_PAGE_HAS_NO_FOCUSED_FIELD,
+            "effect": "refused",
+            "retryable": true,
+            "delivered_chars": 0,
+            "reason": reason,
+        }))
 }
 
 /// The web page text field under window pixel `(x, y)` (native capture
