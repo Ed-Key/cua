@@ -139,30 +139,41 @@ pub enum LineBreaks {
     ShiftReturn,
 }
 
-/// One posted item of typed text.
+/// One posted item of typed text and how many source characters it stands
+/// for ("\r\n" is one line break for two characters, so a stop at the
+/// deadline never splits it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyItem {
     Char(char),
-    ShiftReturn,
-    /// The "\n" of a "\r\n" pair: one line break was already sent.
-    Skip,
+    ShiftReturn { chars: usize },
 }
 
-/// The items `text` is posted as, one per source character, so a count of
-/// posted items is a count of the caller's characters.
+impl KeyItem {
+    fn chars(self) -> usize {
+        match self {
+            KeyItem::Char(_) => 1,
+            KeyItem::ShiftReturn { chars } => chars,
+        }
+    }
+}
+
+/// The items `text` is posted as.
 fn key_items(text: &str, line_breaks: LineBreaks) -> Vec<KeyItem> {
+    let mut items: Vec<KeyItem> = Vec::new();
     let mut previous = None;
-    text.chars()
-        .map(|ch| {
-            let item = match (line_breaks, ch) {
-                (LineBreaks::ShiftReturn, '\n') if previous == Some('\r') => KeyItem::Skip,
-                (LineBreaks::ShiftReturn, '\n' | '\r') => KeyItem::ShiftReturn,
-                _ => KeyItem::Char(ch),
-            };
-            previous = Some(ch);
-            item
-        })
-        .collect()
+    for ch in text.chars() {
+        match (line_breaks, ch) {
+            (LineBreaks::ShiftReturn, '\n') if previous == Some('\r') => {
+                if let Some(KeyItem::ShiftReturn { chars }) = items.last_mut() {
+                    *chars += 1;
+                }
+            }
+            (LineBreaks::ShiftReturn, '\n' | '\r') => items.push(KeyItem::ShiftReturn { chars: 1 }),
+            _ => items.push(KeyItem::Char(ch)),
+        }
+        previous = Some(ch);
+    }
+    items
 }
 
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
@@ -179,10 +190,10 @@ pub fn type_text_with_delay(
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
-    post_until(key_items(text, line_breaks), deadline, |item| {
+    let items = key_items(text, line_breaks);
+    let posted_items = post_until(items.iter().copied(), deadline, |item| {
         let ch = match item {
-            KeyItem::Skip => return Ok(()),
-            KeyItem::ShiftReturn => {
+            KeyItem::ShiftReturn { .. } => {
                 press_key(pid, "return", &["shift"])?;
                 pause_after_char(inter_char_delay_ms);
                 return Ok(());
@@ -204,7 +215,8 @@ pub fn type_text_with_delay(
         post_keyboard_event(pid, &up);
         pause_after_char(inter_char_delay_ms);
         Ok(())
-    })
+    })?;
+    Ok(items[..posted_items].iter().map(|item| item.chars()).sum())
 }
 
 /// Additional inter-character delay on top of the internal key gap.
@@ -1467,10 +1479,12 @@ mod tests {
     #[test]
     fn web_line_breaks_are_shift_return_one_item_per_character() {
         use KeyItem::*;
+        let items = key_items("A\nB\r\nC\r\n\n", LineBreaks::ShiftReturn);
         assert_eq!(
-            key_items("A\nB\r\nC\r\n\n", LineBreaks::ShiftReturn),
-            vec![Char('A'), ShiftReturn, Char('B'), ShiftReturn, Skip, Char('C'), ShiftReturn, Skip, ShiftReturn]
+            items,
+            vec![Char('A'), ShiftReturn { chars: 1 }, Char('B'), ShiftReturn { chars: 2 }, Char('C'), ShiftReturn { chars: 2 }, ShiftReturn { chars: 1 }]
         );
+        assert_eq!(items.iter().map(|i| i.chars()).sum::<usize>(), "A\nB\r\nC\r\n\n".chars().count());
         assert_eq!(
             key_items("A\nB", LineBreaks::Characters),
             vec![Char('A'), Char('\n'), Char('B')]

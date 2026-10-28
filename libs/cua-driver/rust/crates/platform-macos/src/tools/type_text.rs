@@ -1599,8 +1599,17 @@ impl TypingReadback {
             before: None,
             before_range: None,
         };
-        (readback.before, readback.before_range) = readback.sample();
+        (readback.before, readback.before_range) = readback.read_sample();
         readback
+    }
+
+    /// The AX role of the field this read-back watches.
+    fn role(&self) -> String {
+        let ptr = self
+            .element
+            .map(|(ptr, _)| ptr as AXUIElementRef)
+            .or_else(|| self.focused.as_ref().map(|el| el.as_CFTypeRef() as AXUIElementRef));
+        ptr.and_then(|ptr| unsafe { copy_string_attr(ptr, "AXRole") }).unwrap_or_default()
     }
 
     fn selection(&self) -> Option<TextSelectionRange> {
@@ -1626,6 +1635,16 @@ impl TypingReadback {
         if let Some(wid) = self.window_id {
             crate::ax::enablement::refresh_page(self.pid, wid);
         }
+        self.read_sample()
+    }
+
+    /// [`Self::sample`] without the page refresh (right after one).
+    fn read_sample(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<TextSelectionRange>,
+    ) {
         let range = self.selection();
         let value = self.read();
         let after = self.selection();
@@ -1720,13 +1739,19 @@ fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usiz
 /// Whether an element of `role` (with or without an editable ancestor) is a
 /// field that takes typed text.
 fn takes_text(role: &str, editable_ancestor: bool) -> bool {
-    is_text_entry_role(role) || (editable_ancestor && role != "AXWebArea")
+    // Chromium exposes a select-only menu button as AXComboBox too: only an
+    // editable one takes text.
+    matches!(role, "AXTextField" | "AXTextArea" | "AXSearchField")
+        || (editable_ancestor && role != "AXWebArea")
 }
 
-/// How a line break is typed: Shift+Return into web content, where a "\n"
-/// character event inserts nothing (item 42); a character elsewhere.
-fn line_breaks_for(classification: WebAreaClassification) -> crate::input::keyboard::LineBreaks {
-    if classification == WebAreaClassification::WebContent {
+/// How a line break is typed: Shift+Return into a multi-line web field (a
+/// textarea or a contenteditable editor, both AXTextArea), where a "\n"
+/// character event inserts nothing (item 42); a character elsewhere. A
+/// single-line page field keeps the character: Shift+Return there submits
+/// its form.
+fn line_breaks_for(classification: WebAreaClassification, role: &str) -> crate::input::keyboard::LineBreaks {
+    if classification == WebAreaClassification::WebContent && role == "AXTextArea" {
         crate::input::keyboard::LineBreaks::ShiftReturn
     } else {
         crate::input::keyboard::LineBreaks::Characters
@@ -2112,7 +2137,10 @@ fn type_text_blocking(
     let addressed_web_field =
         element_ptr_and_idx.is_some() && target_in_web_area(pid, element_ptr_and_idx, window_id);
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
-    let line_breaks = line_breaks_for(classify_target_web_area(pid, element_ptr_and_idx, window_id));
+    let line_breaks = line_breaks_for(
+        classify_target_web_area(pid, element_ptr_and_idx, window_id),
+        &readback.role(),
+    );
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -2899,20 +2927,25 @@ mod tests {
         assert!(!takes_text("AXButton", false));
         assert!(!takes_text("AXWebArea", true));
         assert!(!takes_text("AXGroup", false));
+        assert!(!takes_text("AXComboBox", false), "a select-only menu button");
+        assert!(takes_text("AXComboBox", true));
     }
 
-    /// Item 42: a line break into web content is Shift+Return; anywhere else,
-    /// including unproven ancestry, it stays a character.
+    /// Item 42: a line break into a multi-line web field is Shift+Return;
+    /// a single-line field, or anywhere else, keeps the character.
     #[test]
     fn web_content_line_breaks_are_shift_return() {
         use crate::input::keyboard::LineBreaks;
-        assert_eq!(line_breaks_for(WebAreaClassification::WebContent), LineBreaks::ShiftReturn);
+        assert_eq!(line_breaks_for(WebAreaClassification::WebContent, "AXTextArea"), LineBreaks::ShiftReturn);
+        for role in ["AXTextField", "AXSearchField", "AXComboBox", "AXWebArea", ""] {
+            assert_eq!(line_breaks_for(WebAreaClassification::WebContent, role), LineBreaks::Characters, "{role}");
+        }
         for other in [
             WebAreaClassification::NonWebContent,
             WebAreaClassification::Incomplete,
             WebAreaClassification::WindowFocusUnavailable,
         ] {
-            assert_eq!(line_breaks_for(other), LineBreaks::Characters);
+            assert_eq!(line_breaks_for(other, "AXTextArea"), LineBreaks::Characters);
         }
     }
 
