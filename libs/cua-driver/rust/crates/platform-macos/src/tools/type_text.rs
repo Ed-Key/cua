@@ -1716,10 +1716,12 @@ fn web_readback_is_untrusted(classification: WebAreaClassification) -> bool {
 }
 
 /// The window pixel (native capture pixels) at the centre of an Electron
-/// page field, when `element` is one: web content (or ancestry that cannot be
-/// proven native) with an on-window frame.
+/// page field, when `element` is one: proven web content with an on-window
+/// frame.
 fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usize) -> Option<(f64, f64)> {
-    if !electron_background_ax_ancestry_is_unsafe(classify_target_web_area(pid, Some((element, Some(idx))), Some(window_id))) {
+    // Proven web content only: delivery's focus checks and key route key off
+    // the same classification, so an unproven ancestry keeps the refusal.
+    if classify_target_web_area(pid, Some((element, Some(idx))), Some(window_id)) != WebAreaClassification::WebContent {
         return None;
     }
     // Only a field takes text: a button or the page itself would take the
