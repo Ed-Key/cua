@@ -330,6 +330,66 @@ impl Tool for TypeTextTool {
             return stopped_at_deadline_result(None, 0, text.chars().count());
         }
 
+        // ── Electron page field by element_token, from behind ──
+        // Focus it the way the px form does (a background focus click at its
+        // centre), prove the page moved focus there, then type into the
+        // focused field with keys: Chromium ignores the AX text write (item 42).
+        let electron_field = match (element_guard.as_ref(), px, window_id, delivery_mode.is_foreground()) {
+            (Some((guard, idx)), None, Some(wid), false)
+                if crate::browser::electron_js::ElectronJs::is_electron(pid) =>
+            {
+                let (guard, idx) = (guard.clone(), *idx);
+                tokio::task::spawn_blocking(move || {
+                    electron_web_field_center(pid, wid, guard.as_ptr(), idx).map(|xy| (xy, guard))
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+        if let (Some(((cx, cy), field)), Some(wid)) = (electron_field.as_ref(), window_id) {
+            if let BackgroundKeyboardPolicy::SemanticOnly(ref refusal) = keyboard_policy {
+                return super::background_refusal_result(pid, wid, refusal);
+            }
+            if let Err(e) = super::focus_by_pixel(
+                &self.state,
+                pid,
+                window_id,
+                *cx,
+                *cy,
+                false,
+                args.opt_str("session"),
+                args.opt_str("_session_id"),
+                false,
+                true,
+                _mutation_lease.as_ref(),
+                background_focus.as_ref(),
+            )
+            .await
+            {
+                return e;
+            }
+            let field = field.clone();
+            let focused = tokio::task::spawn_blocking(move || {
+                crate::ax::enablement::refresh_page(pid, wid);
+                await_addressed_focus(pid, field.as_ptr() as AXUIElementRef, Some(wid))
+            })
+            .await
+            .unwrap_or(false);
+            if !focused {
+                let target = retry_target(&args, pid, px, py, window_id);
+                return web_field_not_focused_result(
+                    target,
+                    &text,
+                    args.opt_str("session").as_deref(),
+                    false,
+                );
+            }
+        }
+        // The field now holds the page's focus: type into the focused element.
+        let element_guard = if electron_field.is_some() { None } else { element_guard };
+
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
         // field to give the Chromium/Electron renderer the real keyboard focus the
@@ -405,7 +465,8 @@ impl Tool for TypeTextTool {
                 _ => {}
             }
         }
-        let used_pixel_focus = px.is_some() && py.is_some() && page_field.is_none();
+        let used_pixel_focus =
+            (px.is_some() && py.is_some() && page_field.is_none()) || electron_field.is_some();
         let element_ptr = element_guard
             .as_ref()
             .map(|(g, idx)| (g.as_ptr(), Some(*idx)))
@@ -1062,7 +1123,7 @@ fn electron_background_ax_refusal(
     }
     Some(BackgroundRefusal {
         code: "background_unavailable",
-        reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; use the pixel-targeted type_text form (x,y), which stays in the background, or delivery_mode:\"foreground\", which brings the app to the front."
+        reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; its centre could not be resolved on the window. Use the pixel-targeted type_text form (x,y) on the field, which also stays in the background."
             .to_owned(),
         advice: Some("px"),
     })
@@ -1522,6 +1583,10 @@ struct TypingReadback {
 
 impl TypingReadback {
     fn capture(pid: i32, element: Option<(usize, Option<usize>)>, window_id: Option<u32>) -> Self {
+        // The focused editor is retained here: read it from a current tree.
+        if let Some(wid) = window_id {
+            crate::ax::enablement::refresh_page(pid, wid);
+        }
         let mut readback = Self {
             pid,
             element,
@@ -1556,6 +1621,11 @@ impl TypingReadback {
         Option<String>,
         Option<TextSelectionRange>,
     ) {
+        // A covered Chromium page reads its state from before the keys until
+        // it is asked to publish (item 42).
+        if let Some(wid) = self.window_id {
+            crate::ax::enablement::refresh_page(self.pid, wid);
+        }
         let range = self.selection();
         let value = self.read();
         let after = self.selection();
@@ -1624,6 +1694,28 @@ fn web_readback_is_untrusted(classification: WebAreaClassification) -> bool {
         classification,
         WebAreaClassification::WebContent | WebAreaClassification::WindowFocusUnavailable
     )
+}
+
+/// The window pixel (native capture pixels) at the centre of an Electron
+/// page field, when `element` is one: web content (or ancestry that cannot be
+/// proven native) with an on-window frame.
+fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usize) -> Option<(f64, f64)> {
+    if !electron_background_ax_ancestry_is_unsafe(classify_target_web_area(pid, Some((element, Some(idx))), Some(window_id))) {
+        return None;
+    }
+    let (screen_x, screen_y) = unsafe { crate::ax::bindings::element_screen_center(element as AXUIElementRef) }?;
+    let frame = super::px_frame::resolve_window_px_frame(window_id).ok()?;
+    Some(((screen_x - frame.bounds.x) * frame.scale, (screen_y - frame.bounds.y) * frame.scale))
+}
+
+/// How a line break is typed: Shift+Return into web content, where a "\n"
+/// character event inserts nothing (item 42); a character elsewhere.
+fn line_breaks_for(classification: WebAreaClassification) -> crate::input::keyboard::LineBreaks {
+    if classification == WebAreaClassification::WebContent {
+        crate::input::keyboard::LineBreaks::ShiftReturn
+    } else {
+        crate::input::keyboard::LineBreaks::Characters
+    }
 }
 
 fn electron_background_ax_ancestry_is_unsafe(classification: WebAreaClassification) -> bool {
@@ -1731,6 +1823,7 @@ fn cgevent_type_verified(
     settle_ms: u64,
     deadline: std::time::Instant,
     web_field: bool,
+    line_breaks: crate::input::keyboard::LineBreaks,
 ) -> anyhow::Result<Keyed> {
     // Background field focus ran inside protected preparation before recipient resolution.
     if settle_ms > 0 {
@@ -1788,6 +1881,7 @@ fn cgevent_type_verified(
         text,
         delay_ms,
         Some(deadline),
+        line_breaks,
     )?;
     if posted < text.chars().count() {
         // Let what was posted land before answering, so the read that
@@ -2003,6 +2097,7 @@ fn type_text_blocking(
     let addressed_web_field =
         element_ptr_and_idx.is_some() && !is_electron && target_in_web_area(pid, element_ptr_and_idx, window_id);
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
+    let line_breaks = line_breaks_for(classify_target_web_area(pid, element_ptr_and_idx, window_id));
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -2055,6 +2150,7 @@ fn type_text_blocking(
                 foreground_settle_ms,
                 deadline,
                 addressed_web_field,
+                line_breaks,
             )
         };
         let (keyed, fronted) = match window_id {
@@ -2178,6 +2274,7 @@ fn type_text_blocking(
                     /*settle_ms=*/ 0,
                     deadline,
                     false,
+                    crate::input::keyboard::LineBreaks::Characters,
                 )
             },
         )?;
@@ -2225,11 +2322,14 @@ fn type_text_blocking(
     // Safari write of 32 landed). A focused element that is not a text control
     // (a web area, a button) cannot take text at all. Both go straight to key
     // events, which reach whatever holds keyboard focus the way a user's
-    // typing does. Electron keeps its own AX rules (see above).
+    // typing does. Electron's page is web content too: Chromium accepts the
+    // write into its contenteditable or textarea and inserts nothing (item 42).
     let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let web_page = !is_electron
-            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let web_page = skips_ax_text_write(
+            target_in_web_area(pid, Some((element as usize, idx_opt)), window_id),
+            is_electron,
+        );
         let keep = ax_text_write_first(&role, owns, web_page);
         if !keep && owns {
             unsafe { CFRelease(element as CFTypeRef) };
@@ -2434,6 +2534,7 @@ fn type_text_blocking(
                 /*settle_ms=*/ 0,
                 deadline,
                 addressed_web_field,
+                line_breaks,
             )
         },
     )?;
@@ -2621,6 +2722,7 @@ fn web_text_field_at_window_pixel(
 /// briefly for it to move, so the read-back watches the field the keys reach
 /// rather than reporting it unreadable.
 fn settle_web_area_focus(pid: i32, window_id: u32) {
+    crate::ax::enablement::refresh_page(pid, window_id);
     let deadline = std::time::Instant::now() + WEB_FOCUS_TIMEOUT;
     loop {
         let role = unsafe {
@@ -2698,9 +2800,18 @@ fn is_text_entry_role(role: &str) -> bool {
 
 /// Whether an AX text write is the first rung for a target with AX `role`.
 /// `implicit`: the window's focused element rather than an addressed one.
-/// `web_page`: the target is in a web page outside Electron.
+/// `web_page`: the target is in web content (a browser page or an Electron
+/// app's page).
 fn ax_text_write_first(role: &str, implicit: bool, web_page: bool) -> bool {
     !web_page && (is_text_entry_role(role) || !implicit)
+}
+
+/// Whether a target skips the AX text write for keys: any web content,
+/// an Electron app's page included (`_electron`: Chromium accepts the write
+/// into an Electron 44 contenteditable or textarea and inserts nothing,
+/// item 42). Native controls keep the write.
+fn skips_ax_text_write(in_web_area: bool, _electron: bool) -> bool {
+    in_web_area
 }
 
 /// A Chromium-family browser, not an Electron app (Electron keeps its own
@@ -2772,6 +2883,31 @@ mod tests {
             web_shortfall_is_unknown(None, Some(Unreadable), 5, true),
             (None, Some(Unreadable))
         );
+    }
+
+    /// Item 42: an Electron page field takes keys, never the AX text write
+    /// (Chromium accepts it and inserts nothing); a native control in an
+    /// Electron app keeps the write.
+    #[test]
+    fn electron_page_fields_take_keys_not_the_ax_write() {
+        assert!(!ax_text_write_first("AXTextArea", true, skips_ax_text_write(true, true)));
+        assert!(!ax_text_write_first("AXTextArea", false, skips_ax_text_write(true, true)));
+        assert!(ax_text_write_first("AXTextField", true, skips_ax_text_write(false, true)));
+    }
+
+    /// Item 42: a line break into web content is Shift+Return; anywhere else,
+    /// including unproven ancestry, it stays a character.
+    #[test]
+    fn web_content_line_breaks_are_shift_return() {
+        use crate::input::keyboard::LineBreaks;
+        assert_eq!(line_breaks_for(WebAreaClassification::WebContent), LineBreaks::ShiftReturn);
+        for other in [
+            WebAreaClassification::NonWebContent,
+            WebAreaClassification::Incomplete,
+            WebAreaClassification::WindowFocusUnavailable,
+        ] {
+            assert_eq!(line_breaks_for(other), LineBreaks::Characters);
+        }
     }
 
     #[test]
@@ -3515,6 +3651,7 @@ mod tests {
                 settle_ms,
                 std::time::Instant::now(),
                 true,
+                crate::input::keyboard::LineBreaks::ShiftReturn,
             );
             let case = format!("{role} settle {settle_ms}");
             let error = result.err().unwrap_or_else(|| panic!("{case}: must refuse"));

@@ -596,6 +596,9 @@ async fn focused_element_holds_point(
             return false;
         };
         let (screen_x, screen_y, _, _) = frame.to_screen(x, y);
+        // A covered Chromium page's focus reads stale until it publishes
+        // (item 42); skipping the click on a stale focus would type elsewhere.
+        crate::ax::enablement::refresh_page(pid, wid);
         unsafe {
             let Some(focused) = crate::ax::bindings::focused_element_of_pid(pid) else {
                 return false;

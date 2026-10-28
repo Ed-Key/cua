@@ -126,6 +126,45 @@ fn post_until<T>(
     Ok(posted)
 }
 
+/// How typed text's line breaks are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineBreaks {
+    /// As characters, like every other character (native text views insert
+    /// them).
+    Characters,
+    /// As Shift+Return. A web page ignores a key event whose only content is
+    /// "\n" (Chromium reads it as an Unidentified key and inserts nothing,
+    /// item 42); Shift+Return is a line break in a textarea and in chat
+    /// composers where Return sends (Slack, Discord).
+    ShiftReturn,
+}
+
+/// One posted item of typed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyItem {
+    Char(char),
+    ShiftReturn,
+    /// The "\n" of a "\r\n" pair: one line break was already sent.
+    Skip,
+}
+
+/// The items `text` is posted as, one per source character, so a count of
+/// posted items is a count of the caller's characters.
+fn key_items(text: &str, line_breaks: LineBreaks) -> Vec<KeyItem> {
+    let mut previous = None;
+    text.chars()
+        .map(|ch| {
+            let item = match (line_breaks, ch) {
+                (LineBreaks::ShiftReturn, '\n') if previous == Some('\r') => KeyItem::Skip,
+                (LineBreaks::ShiftReturn, '\n' | '\r') => KeyItem::ShiftReturn,
+                _ => KeyItem::Char(ch),
+            };
+            previous = Some(ch);
+            item
+        })
+        .collect()
+}
+
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
 /// pause after each character (on top of the internal down/up key gap).
 /// Stops before the first character that would start at or after `deadline`;
@@ -135,11 +174,21 @@ pub fn type_text_with_delay(
     text: &str,
     inter_char_delay_ms: u64,
     deadline: Option<std::time::Instant>,
+    line_breaks: LineBreaks,
 ) -> anyhow::Result<usize> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
-    post_until(text.chars(), deadline, |ch| {
+    post_until(key_items(text, line_breaks), deadline, |item| {
+        let ch = match item {
+            KeyItem::Skip => return Ok(()),
+            KeyItem::ShiftReturn => {
+                press_key(pid, "return", &["shift"])?;
+                pause_after_char(inter_char_delay_ms);
+                return Ok(());
+            }
+            KeyItem::Char(ch) => ch,
+        };
         let ch_str = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -153,15 +202,18 @@ pub fn type_text_with_delay(
         up.set_string(&ch_str);
         up.set_flags(CGEventFlags::CGEventFlagNull);
         post_keyboard_event(pid, &up);
-
-        // Additional inter-character delay on top of the internal key gap.
-        if inter_char_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
-        } else {
-            key_gap_sleep();
-        }
+        pause_after_char(inter_char_delay_ms);
         Ok(())
     })
+}
+
+/// Additional inter-character delay on top of the internal key gap.
+fn pause_after_char(inter_char_delay_ms: u64) {
+    if inter_char_delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
+    } else {
+        key_gap_sleep();
+    }
 }
 
 /// Send a key combination (hotkey) to `pid`.
@@ -1408,6 +1460,21 @@ mod tests {
     fn physical_text_rejects_characters_without_a_lossless_keycode() {
         let error = physical_text_events('🙂').unwrap_err().to_string();
         assert!(error.contains("U+1F642"), "{error}");
+    }
+
+    /// Item 42: on web content a line break is Shift+Return ("\r\n" once),
+    /// and every source character is still one posted item.
+    #[test]
+    fn web_line_breaks_are_shift_return_one_item_per_character() {
+        use KeyItem::*;
+        assert_eq!(
+            key_items("A\nB\r\nC\r\n\n", LineBreaks::ShiftReturn),
+            vec![Char('A'), ShiftReturn, Char('B'), ShiftReturn, Skip, Char('C'), ShiftReturn, Skip, ShiftReturn]
+        );
+        assert_eq!(
+            key_items("A\nB", LineBreaks::Characters),
+            vec![Char('A'), Char('\n'), Char('B')]
+        );
     }
 
     #[test]

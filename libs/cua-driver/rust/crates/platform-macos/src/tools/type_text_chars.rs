@@ -128,7 +128,7 @@ impl Tool for TypeTextCharsTool {
                     .filter(|_| !type_chars_only)
                     .map(|_| &prepare_element as &dyn Fn() -> anyhow::Result<()>),
                 |recipient| {
-                    crate::input::keyboard::type_text_with_delay(recipient, &text, delay_ms, None)
+                    crate::input::keyboard::type_text_with_delay(recipient, &text, delay_ms, None, crate::input::keyboard::LineBreaks::Characters)
                         .map(drop)
                 },
             )

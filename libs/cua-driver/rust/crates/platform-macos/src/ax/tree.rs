@@ -292,6 +292,9 @@ pub fn walk_tree_budgeted(
             // refusal, so each launch-wait attempt asks again.
             let attempt_started = Instant::now();
             super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
+            if let Some(wid) = window_id {
+                super::enablement::refresh_page(pid, wid);
+            }
 
             let (top_level, top_level_read_failed) = copy_top_level(app_elem, pid, window_id);
 
