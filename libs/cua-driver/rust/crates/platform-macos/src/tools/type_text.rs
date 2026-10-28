@@ -1785,6 +1785,7 @@ enum Began {
 /// | began | focus now | outcome |
 /// |---|---|---|
 /// | Field | the same element, a field | keys, the decision's line break |
+/// | (foreground) any | a different element | keys, line break from that element's role |
 /// | Field | another element, the page, or unreadable | refused, no key |
 /// | Page | the page itself | keys (they reach its focused element), character line break |
 /// | Page | a field (the page reported it once its window took key focus) | keys, line break from that field's role if web is Yes |
@@ -1847,13 +1848,14 @@ fn last_check(decision: TypingDecision, background: bool, same: Option<bool>, ro
         return LastCheck::Keys(decision.line_breaks);
     }
     let field = takes_text(role, editable);
-    let page_reported = decision.began == Began::Page && field;
-    let line_breaks = if page_reported {
-        line_breaks_for(decision.web == Web::Yes, role)
-    } else if decision.began == Began::Field {
-        decision.line_breaks
-    } else {
-        LineBreaks::Characters
+    // The line break follows the element the keys will reach: the retained
+    // one keeps the decision's mode; any other (the field a page reports,
+    // or focus moved by fronting) takes its own role, never a stale
+    // Shift+Return a single-line field would submit on.
+    let line_breaks = match same {
+        Some(true) => decision.line_breaks,
+        _ if decision.web == Web::Yes => line_breaks_for(true, role),
+        _ => LineBreaks::Characters,
     };
     if !background {
         return LastCheck::Keys(line_breaks);
@@ -2650,8 +2652,7 @@ fn type_text_blocking(
         // AXValue is not renderer evidence in web content. An unchanged echo
         // there cannot prove that zero characters landed, so blind retry is
         // unsafe even though no synthesis has run yet.
-        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
-            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged) && decision.web_rules();
         if owns {
             unsafe {
                 CFRelease(element as _);
@@ -3189,7 +3190,8 @@ mod tests {
         assert_eq!(last_check(unread, true, Some(false), "AXTextArea", false), k(Characters));
         assert_eq!(last_check(unread, true, Some(false), "AXButton", false), LastCheck::Refuse);
         // foreground: no identity rows
-        assert_eq!(last_check(field, false, Some(false), "AXButton", false), k(ShiftReturn));
+        assert_eq!(last_check(field, false, Some(true), "AXTextArea", false), k(ShiftReturn));
+        assert_eq!(last_check(field, false, Some(false), "AXTextField", false), k(Characters), "fronting moved focus to a single-line field");
         assert_eq!(last_check(page, false, Some(false), "AXTextArea", false), k(ShiftReturn));
         // native: unchanged
         assert_eq!(last_check(native, true, None, "", false), k(Characters));
