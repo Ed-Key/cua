@@ -629,9 +629,11 @@ impl Tool for TypeTextTool {
                 }))
             }
             Ok(Ok(outcome)) => {
+                // A token proven to be an Electron page field stays web
+                // content here even if this late ancestry read fails.
                 let target_is_web_content = outcome.verified
                     && path_has_untrusted_web_readback(outcome.path)
-                    && target_in_web_area(pid, element_ptr, window_id);
+                    && (electron_field.is_some() || target_in_web_area(pid, element_ptr, window_id));
                 let surface = if !target_is_web_content {
                     WebSurface::Other
                 } else if crate::browser::electron_js::ElectronJs::is_electron(pid) {
@@ -2217,10 +2219,15 @@ fn type_text_blocking(
     // to the AX write, character line breaks or a retryable partial count.
     // Proven web content picks the line-break mode; the untrusted reading
     // (an unavailable window focus counts as web) keeps every other rule.
+    // Implicit typing is judged on the field the read-back retained, not on
+    // whatever holds focus by now.
+    let judged = element_ptr_and_idx.or_else(|| {
+        readback.focused.as_ref().map(|focused| (focused.as_CFTypeRef() as usize, None))
+    });
     let web_proven = proven_web_field
         || (element_ptr_and_idx.is_none() && readback.began_on_page_field)
-        || classify_target_web_area(pid, element_ptr_and_idx, window_id) == WebAreaClassification::WebContent;
-    let web_target = web_proven || target_in_web_area(pid, element_ptr_and_idx, window_id);
+        || classify_target_web_area(pid, judged, window_id) == WebAreaClassification::WebContent;
+    let web_target = web_proven || target_in_web_area(pid, judged, window_id);
     let addressed_web_field = element_ptr_and_idx.is_some() && web_target;
     let line_breaks = line_breaks_for(web_proven, &readback.role());
 
