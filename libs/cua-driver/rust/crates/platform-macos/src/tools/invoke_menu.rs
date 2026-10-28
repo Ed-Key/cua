@@ -1453,12 +1453,17 @@ impl Tool for InvokeMenuTool {
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
             let hidden_before = app_hidden(pid) == Some(true);
 
-            // Read before the press: a command can retitle its item (New
-            // Folder with Selection), and the editor wait needs the answer.
-            let opens_editor = crate::tools::edit_commit::app_saves_on_end_editing(pid)
+            // Read once the target window is key and before the press: a
+            // command can retitle its item (New Folder with Selection), and
+            // the editor wait needs the answer.
+            // ponytail: a localized title that the menu has not yet updated
+            // for this window falls back to the shortcut, then to the generic
+            // wait (as before item 41); English titles match by prefix.
+            let focused = focus_exact_window(pid, window_id);
+            let opens_editor = focused.is_ok()
+                && crate::tools::edit_commit::app_saves_on_end_editing(pid)
                 && item_opens_editor(pid, &path);
-            let result = focus_exact_window(pid, window_id)
-                .and_then(|()| unsafe { invoke_path(pid, &path) });
+            let result = focused.and_then(|()| unsafe { invoke_path(pid, &path) });
 
             // Restore the exact prior key window of another application when one
             // was observable, falling back to app activation for apps without
