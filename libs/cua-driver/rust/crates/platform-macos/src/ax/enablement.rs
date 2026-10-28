@@ -251,7 +251,10 @@ pub(crate) fn refresh_page(pid: i32, window_id: u32) {
         }
         let mut window = None;
         for candidate in copy_ax_windows(app.0) {
-            if window.is_none() && super::bindings::ax_get_window_id(candidate) == Some(window_id) {
+            if window.is_none()
+                && bound_by(candidate, deadline)
+                && super::bindings::ax_get_window_id(candidate) == Some(window_id)
+            {
                 window = Some(candidate);
             } else {
                 CFRelease(candidate as CFTypeRef);

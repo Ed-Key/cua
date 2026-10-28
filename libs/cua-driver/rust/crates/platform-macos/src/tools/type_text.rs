@@ -387,8 +387,8 @@ impl Tool for TypeTextTool {
                 );
             }
         }
-        // The field now holds the page's focus: type into the focused element.
-        let element_guard = if electron_field.is_some() { None } else { element_guard };
+        // The field keeps its identity through delivery: the key rung proves
+        // it still holds focus right before the first key, and reads it back.
 
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
@@ -1703,9 +1703,24 @@ fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usiz
     if !electron_background_ax_ancestry_is_unsafe(classify_target_web_area(pid, Some((element, Some(idx))), Some(window_id))) {
         return None;
     }
+    // Only a field takes text: a button or the page itself would take the
+    // keys as shortcuts, so those keep the refusal.
+    let role = unsafe { copy_string_attr(element as AXUIElementRef, "AXRole") }.unwrap_or_default();
+    let editable = unsafe { crate::ax::bindings::copy_element_attr(element as AXUIElementRef, "AXEditableAncestor") }
+        .map(|ancestor| unsafe { CFRelease(ancestor as CFTypeRef) })
+        .is_some();
+    if !takes_text(&role, editable) {
+        return None;
+    }
     let (screen_x, screen_y) = unsafe { crate::ax::bindings::element_screen_center(element as AXUIElementRef) }?;
     let frame = super::px_frame::resolve_window_px_frame(window_id).ok()?;
     Some(((screen_x - frame.bounds.x) * frame.scale, (screen_y - frame.bounds.y) * frame.scale))
+}
+
+/// Whether an element of `role` (with or without an editable ancestor) is a
+/// field that takes typed text.
+fn takes_text(role: &str, editable_ancestor: bool) -> bool {
+    is_text_entry_role(role) || (editable_ancestor && role != "AXWebArea")
 }
 
 /// How a line break is typed: Shift+Return into web content, where a "\n"
@@ -2091,11 +2106,11 @@ fn type_text_blocking(
     if let (None, Some(wid), false) = (element_ptr_and_idx, window_id, delivery_mode.is_foreground()) {
         settle_web_area_focus(pid, wid);
     }
-    // An addressed field in a web page (outside Electron, which keeps its own
-    // rules): its keys are guarded by a focus proof on either route.
-    let is_electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
+    // An addressed field in web content: its keys are guarded by a focus
+    // proof on either route. A token-addressed Electron field reaches here
+    // only after its pixel focus was proven (item 42).
     let addressed_web_field =
-        element_ptr_and_idx.is_some() && !is_electron && target_in_web_area(pid, element_ptr_and_idx, window_id);
+        element_ptr_and_idx.is_some() && target_in_web_area(pid, element_ptr_and_idx, window_id);
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
     let line_breaks = line_breaks_for(classify_target_web_area(pid, element_ptr_and_idx, window_id));
 
@@ -2326,10 +2341,7 @@ fn type_text_blocking(
     // write into its contenteditable or textarea and inserts nothing (item 42).
     let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let web_page = skips_ax_text_write(
-            target_in_web_area(pid, Some((element as usize, idx_opt)), window_id),
-            is_electron,
-        );
+        let web_page = target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
         let keep = ax_text_write_first(&role, owns, web_page);
         if !keep && owns {
             unsafe { CFRelease(element as CFTypeRef) };
@@ -2806,14 +2818,6 @@ fn ax_text_write_first(role: &str, implicit: bool, web_page: bool) -> bool {
     !web_page && (is_text_entry_role(role) || !implicit)
 }
 
-/// Whether a target skips the AX text write for keys: any web content,
-/// an Electron app's page included (`_electron`: Chromium accepts the write
-/// into an Electron 44 contenteditable or textarea and inserts nothing,
-/// item 42). Native controls keep the write.
-fn skips_ax_text_write(in_web_area: bool, _electron: bool) -> bool {
-    in_web_area
-}
-
 /// A Chromium-family browser, not an Electron app (Electron keeps its own
 /// AX rules above).
 fn is_chromium_browser_pid(pid: i32) -> bool {
@@ -2885,14 +2889,16 @@ mod tests {
         );
     }
 
-    /// Item 42: an Electron page field takes keys, never the AX text write
-    /// (Chromium accepts it and inserts nothing); a native control in an
-    /// Electron app keeps the write.
+    /// Item 42: an Electron page element addressed by token is focused and
+    /// typed into only when it is a field; a button or the page is refused.
     #[test]
-    fn electron_page_fields_take_keys_not_the_ax_write() {
-        assert!(!ax_text_write_first("AXTextArea", true, skips_ax_text_write(true, true)));
-        assert!(!ax_text_write_first("AXTextArea", false, skips_ax_text_write(true, true)));
-        assert!(ax_text_write_first("AXTextField", true, skips_ax_text_write(false, true)));
+    fn only_fields_take_token_typing_on_an_electron_page() {
+        assert!(takes_text("AXTextArea", false));
+        assert!(takes_text("AXTextField", true));
+        assert!(takes_text("AXStaticText", true), "a rich editor's own text node");
+        assert!(!takes_text("AXButton", false));
+        assert!(!takes_text("AXWebArea", true));
+        assert!(!takes_text("AXGroup", false));
     }
 
     /// Item 42: a line break into web content is Shift+Return; anywhere else,
