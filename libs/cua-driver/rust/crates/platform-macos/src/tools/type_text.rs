@@ -333,15 +333,15 @@ impl Tool for TypeTextTool {
 
         // ── Electron page field by element_token, from behind ──
         // Focus it the way the px form does (a background focus click at its
-        // centre), prove the page moved focus there, then type into the
-        // focused field with keys: Chromium ignores the AX text write (item 42).
+        // centre), then type with keys into the addressed field, whose focus
+        // the key rung proves: Chromium ignores the AX text write (item 42).
         let electron_field = match (element_guard.as_ref(), px, window_id, delivery_mode.is_foreground()) {
             (Some((guard, idx)), None, Some(wid), false)
                 if crate::browser::electron_js::ElectronJs::is_electron(pid) =>
             {
                 let (guard, idx) = (guard.clone(), *idx);
                 tokio::task::spawn_blocking(move || {
-                    electron_web_field_center(pid, wid, guard.as_ptr(), idx).map(|xy| (xy, guard))
+                    electron_web_field_center(pid, wid, guard.as_ptr(), idx)
                 })
                 .await
                 .ok()
@@ -349,7 +349,7 @@ impl Tool for TypeTextTool {
             }
             _ => None,
         };
-        if let (Some(((cx, cy), field)), Some(wid)) = (electron_field.as_ref(), window_id) {
+        if let (Some((cx, cy)), Some(wid)) = (electron_field, window_id) {
             if let BackgroundKeyboardPolicy::SemanticOnly(ref refusal) = keyboard_policy {
                 return super::background_refusal_result(pid, wid, refusal);
             }
@@ -357,8 +357,8 @@ impl Tool for TypeTextTool {
                 &self.state,
                 pid,
                 window_id,
-                *cx,
-                *cy,
+                cx,
+                cy,
                 false,
                 args.opt_str("session"),
                 args.opt_str("_session_id"),
@@ -371,22 +371,10 @@ impl Tool for TypeTextTool {
             {
                 return e;
             }
-            let field = field.clone();
-            let focused = tokio::task::spawn_blocking(move || {
-                crate::ax::enablement::refresh_page(pid, wid);
-                await_addressed_focus(pid, field.as_ptr() as AXUIElementRef, Some(wid))
-            })
-            .await
-            .unwrap_or(false);
-            if !focused {
-                let target = retry_target(&args, pid, px, py, window_id);
-                return web_field_not_focused_result(
-                    target,
-                    &text,
-                    args.opt_str("session").as_deref(),
-                    false,
-                );
-            }
+            // The page takes the field's focus once its window is made key
+            // for the keys; the key rung proves it then, and again right
+            // before the first key (a covered page reports the page itself
+            // focused until that moment).
         }
         // The field keeps its identity through delivery: the key rung proves
         // it still holds focus right before the first key, and reads it back.
