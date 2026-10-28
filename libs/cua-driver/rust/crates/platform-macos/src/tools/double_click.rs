@@ -48,6 +48,23 @@ fn opens_from_behind(
         && matches!(role, "AXImage" | "AXTextField")
 }
 
+/// The name a Finder item shows (an icon's title, a name field's value), so
+/// the item opened is proven to be the one asked for; `None` when it has none.
+fn item_name(element: AXUIElementRef) -> Option<String> {
+    ["AXTitle", "AXValue", "AXDescription"]
+        .into_iter()
+        .filter_map(|attribute| unsafe { crate::ax::bindings::copy_string_attr(element, attribute) })
+        .find(|name| !name.trim().is_empty())
+}
+
+/// Why the open from behind did not run.
+enum NotFromBehind {
+    /// Nothing was opened: AXOpen runs, and the result says why.
+    AxOpen(String),
+    /// The element now names another item: neither route runs.
+    Refuse(String),
+}
+
 /// Finder's Open command, run from behind by its key equivalent Cmd+O.
 // ponytail: English menu titles; another language does not find the item and
 // keeps AXOpen (the result says why).
@@ -63,7 +80,8 @@ impl DoubleClickTool {
     /// from behind (invoke_menu's route; never in front). One per-process
     /// lease covers both, so no other input to Finder lands between them.
     /// `Ok`: the open was sent (it is never sent again another way). `Err`:
-    /// why nothing was opened, for the AXOpen fallback.
+    /// why nothing was opened: AXOpen, or a refusal when the element now
+    /// names another item.
     async fn open_finder_item_from_behind(
         &self,
         args: &Value,
@@ -72,13 +90,21 @@ impl DoubleClickTool {
         idx: usize,
         element_guard: crate::ax::snapshot::RetainedElement,
         lease: &super::BackgroundMutationLease,
-    ) -> Result<String, String> {
+    ) -> Result<String, NotFromBehind> {
         use cua_driver_core::tool::Tool;
         let mut click_args = args.clone();
         if let Some(map) = click_args.as_object_mut() {
             map.remove("delivery_mode");
         }
         let click = super::click::ClickTool::new(self.state.clone());
+        let name_guard = element_guard.clone();
+        let asked = crate::background_mutation::spawn_blocking(move || {
+            item_name(name_guard.as_ptr() as AXUIElementRef)
+        })
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| NotFromBehind::AxOpen("the item's name could not be read".into()))?;
         crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async move {
             let selected = click.invoke(click_args).await;
             let said = selected
@@ -90,23 +116,40 @@ impl DoubleClickTool {
                 })
                 .unwrap_or_default();
             if selected.is_error == Some(true) {
-                return Err(format!("selecting the item from behind failed ({said})"));
+                return Err(NotFromBehind::AxOpen(format!(
+                    "selecting the item from behind failed ({said})"
+                )));
             }
-            let alone = crate::background_mutation::spawn_blocking(move || {
-                crate::input::ax_actions::RowSelection::capture(element_guard.as_ptr())
-                    .and_then(|row| row.observe())
-                    .is_some_and(|readback| readback.exclusive())
+            // The item named as asked, and Finder's only selection: Cmd+O opens
+            // exactly it. A list that refreshed can hand the element to
+            // another item; then nothing is opened.
+            let (now, alone) = crate::background_mutation::spawn_blocking(move || {
+                let ptr = element_guard.as_ptr();
+                (
+                    item_name(ptr as AXUIElementRef),
+                    crate::input::ax_actions::RowSelection::capture(ptr)
+                        .and_then(|row| row.observe())
+                        .is_some_and(|readback| readback.exclusive()),
+                )
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or((None, false));
+            if now.as_deref() != Some(asked.as_str()) {
+                return Err(NotFromBehind::Refuse(format!(
+                    "element [{idx}] named {asked:?} before the click and {} after it, so it was not opened; take a fresh snapshot",
+                    now.map_or_else(|| "nothing readable".to_owned(), |now| format!("{now:?}"))
+                )));
+            }
             if !alone {
-                return Err(
+                return Err(NotFromBehind::AxOpen(
                     "the item could not be read back as Finder's only selection after the click, so File > Open could open something else"
                         .into(),
-                );
+                ));
             }
             let path = FINDER_OPEN.iter().map(|segment| (*segment).to_owned()).collect();
-            let opened = super::invoke_menu::press_from_behind_only(pid, wid, path).await?;
+            let opened = super::invoke_menu::press_from_behind_only(pid, wid, path)
+                .await
+                .map_err(NotFromBehind::AxOpen)?;
             Ok(format!(
                 "Opened element [{idx}] from behind: selected it (the only selection), then ran Finder's File > Open from behind instead of AXOpen, which raises Finder's window. {opened}"
             ))
@@ -223,7 +266,10 @@ impl Tool for DoubleClickTool {
                     .await
                 {
                     Ok(text) => return ToolResult::text(text),
-                    Err(why) => not_from_behind = Some(why),
+                    Err(NotFromBehind::Refuse(why)) => {
+                        return ToolResult::error(format!("double_click refused: {why}"))
+                    }
+                    Err(NotFromBehind::AxOpen(why)) => not_from_behind = Some(why),
                 }
             }
 

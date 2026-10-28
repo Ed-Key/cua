@@ -652,6 +652,18 @@ fn choose_press(
     }
 }
 
+/// A caller that needs the item's key equivalent (an AX press of an item
+/// that reads disabled, or whose state could not be read, does nothing and
+/// still reads as sent) takes no AX press.
+fn keys_allowed(press: Press, keys_only: bool) -> Result<Press, &'static str> {
+    match press {
+        Press::Ax(_) if keys_only => Err(
+            "the item would be pressed through accessibility, and only its key equivalent is used for this command",
+        ),
+        press => Ok(press),
+    }
+}
+
 /// How a press made from behind ended.
 #[derive(Debug, PartialEq)]
 enum Background {
@@ -835,7 +847,13 @@ const BACKGROUND_VERDICT_AFTER: Duration = Duration::from_millis(400);
 /// within [`BACKGROUND_EFFECT_WAIT`] showed changed against two steady reads
 /// before it (nothing, when the command shows its effect later or not at
 /// all: it is still pressed, and is not pressed again).
-fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) -> Background {
+fn press_in_background(
+    pid: i32,
+    window_id: u32,
+    path: &[String],
+    prior: i32,
+    keys_only: bool,
+) -> Background {
     if let Some(why) = front_route_for_inline_edit(
         crate::tools::edit_commit::app_saves_on_end_editing(pid),
         || item_opens_editor(pid, path),
@@ -860,7 +878,7 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                     shortcut_modifiers(item),
                 ),
             );
-            let press = match press {
+            let press = match press.and_then(|press| keys_allowed(press, keys_only)) {
                 Ok(press) => press,
                 Err(why) => return Background::skipped(why),
             };
@@ -1265,9 +1283,9 @@ fn behind_only(outcome: Background, restore: impl FnOnce() -> bool) -> Result<St
     after_background(outcome, restore).map(|ran| summary(&ran))
 }
 
-/// Run the final item of `path` from behind and never in front, for a tool
-/// that has a route of its own when this one cannot run (double_click opens
-/// a Finder item with File > Open). Holds the per-process lease (or reuses
+/// Run the final item of `path` from behind and never in front, by its key
+/// equivalent only, for a tool that has a route of its own when this one
+/// cannot run (double_click opens a Finder item with File > Open). Holds the per-process lease (or reuses
 /// the caller's) and the foreground turn, as [`InvokeMenuTool`] does.
 pub(crate) async fn press_from_behind_only(
     pid: i32,
@@ -1291,7 +1309,7 @@ pub(crate) async fn press_from_behind_only(
             crate::apps::confirm_front(prior)
                 || (crate::apps::restore_prior_app(prior) && crate::apps::confirm_front(prior))
         };
-        behind_only(press_in_background(pid, window_id, &path, prior), restore)
+        behind_only(press_in_background(pid, window_id, &path, prior, true), restore)
     })
     .await
     .unwrap_or_else(|error| Err(format!("the press from behind did not run ({error})")))
@@ -1484,7 +1502,7 @@ impl Tool for InvokeMenuTool {
                         || (crate::apps::restore_prior_app(prior)
                             && crate::apps::confirm_front(prior))
                 };
-                match after_background(press_in_background(pid, window_id, &path, prior), restore) {
+                match after_background(press_in_background(pid, window_id, &path, prior, false), restore) {
                     Ok(ran) => return Ok(ran),
                     Err(why) => why_foreground = Some(why),
                 }
@@ -2122,6 +2140,14 @@ mod tests {
             text.contains("AX error -25204") && text.contains("the app's windows changed"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_keys_only_press_takes_no_accessibility_press() {
+        let keys = Press::Keys { key: "o".into(), modifiers: vec!["cmd"] };
+        assert_eq!(keys_allowed(keys.clone(), true), Ok(keys.clone()));
+        assert!(keys_allowed(Press::Ax("AXPress"), true).is_err());
+        assert_eq!(keys_allowed(Press::Ax("AXPress"), false), Ok(Press::Ax("AXPress")));
     }
 
     #[test]

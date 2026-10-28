@@ -149,7 +149,9 @@ fn double_click_on_a_finder_folder_behind_another_app_opens_it_from_behind() {
     );
     assert!(!result.is_error(), "opening a Finder folder from behind failed: {}", result.text());
     assert!(
-        result.text().contains("from behind") && !result.text().contains("AXOpen performed"),
+        result.text().contains("from behind")
+            && result.text().contains("cmd+o")
+            && !result.text().contains("AXOpen performed"),
         "double_click did not open the folder from behind: {}",
         result.text()
     );
