@@ -2749,7 +2749,7 @@ fn resolve_element_action(requested: &str, advertised: &[String]) -> Result<Stri
 /// Whether an element's live name still matches the row its token named:
 /// the snapshot's rendered row contains it. Unknown snapshots and empty
 /// names pass; values are not compared (they change on their own).
-pub(super) fn still_names_row(snapshot_row: Option<&str>, live_name: &str) -> bool {
+fn still_names_row(snapshot_row: Option<&str>, live_name: &str) -> bool {
     let name = live_name.trim();
     name.is_empty() || snapshot_row.is_none_or(|row| row.contains(name))
 }

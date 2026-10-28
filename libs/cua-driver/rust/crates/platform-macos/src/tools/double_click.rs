@@ -77,6 +77,18 @@ fn token_refused(structured: Option<&Value>) -> bool {
     })
 }
 
+/// Whether a snapshot row (its rendered line, see ax::tree::format_node_line)
+/// shows exactly `name` as its title, value or description, not as a part of
+/// a longer name ("Report" is not "Reports"). No row known: nothing to
+/// compare against.
+fn row_names_exactly(row: Option<&str>, name: &str) -> bool {
+    row.is_none_or(|row| {
+        row.contains(&format!("\"{name}\""))
+            || row.contains(&serde_json::json!(name).to_string())
+            || row.contains(&format!("({name})"))
+    })
+}
+
 /// Why the open from behind did not run.
 enum NotFromBehind {
     /// Nothing was opened: AXOpen runs, and the result says why.
@@ -128,7 +140,7 @@ impl DoubleClickTool {
         .ok_or_else(|| NotFromBehind::AxOpen("the item's name could not be read".into()))?;
         // The name the snapshot showed for this element: a list that refreshed
         // after the snapshot can have handed the element to another item.
-        if !super::click::still_names_row(snapshot_row.as_deref(), &asked) {
+        if !row_names_exactly(snapshot_row.as_deref(), &asked) {
             return Err(NotFromBehind::Refuse(format!(
                 "element [{idx}] now names {asked:?}, not what the snapshot showed; the app reused it for other content. Nothing was sent. Take a fresh snapshot"
             )));
@@ -645,6 +657,17 @@ fn ax_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_snapshot_row_must_show_the_whole_name() {
+        let icon = "- [51] AXImage \"Reports\" [actions=[open,show_menu]]";
+        let field = "- [74] AXTextField = \"Report \\\"Q3\\\".txt\" [actions=[open]]";
+        assert!(row_names_exactly(Some(icon), "Reports"));
+        assert!(!row_names_exactly(Some(icon), "Report"));
+        assert!(row_names_exactly(Some(field), "Report \"Q3\".txt"));
+        assert!(!row_names_exactly(Some(field), "Q3"));
+        assert!(row_names_exactly(None, "anything"));
+    }
 
     #[test]
     fn a_click_that_refused_the_element_itself_is_not_followed_by_axopen() {
