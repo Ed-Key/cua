@@ -26,9 +26,92 @@ fn background_action_for_element(
     }
 }
 
+/// Whether a background double_click opens this element from behind with
+/// Finder's File > Open instead of AXOpen: an item of Finder's file view (its
+/// icon, or its name in list and column view) while another app is in front.
+/// AXOpen raises Finder's window above the user's app in the bench image
+/// (item 43). Finder's sidebar cells advertise AXOpen too; they and any other
+/// role keep AXOpen.
+// ponytail: role allowlist from the bench image's icon, list and column views
+// (gallery and desktop items are AXImage too); an unknown role keeps AXOpen.
+fn opens_from_behind(
+    foreground: bool,
+    has_ax_open: bool,
+    finder: bool,
+    role: &str,
+    other_app_in_front: bool,
+) -> bool {
+    !foreground
+        && has_ax_open
+        && finder
+        && other_app_in_front
+        && matches!(role, "AXImage" | "AXTextField")
+}
+
+/// Finder's Open command, run from behind by its key equivalent Cmd+O.
+// ponytail: English menu titles; another language does not find the item and
+// keeps AXOpen (the result says why).
+const FINDER_OPEN: [&str; 2] = ["File", "Open"];
+
 impl DoubleClickTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
+    }
+
+    /// Open a Finder item from behind: select it through the click tool's own
+    /// element path, prove it is the only selection, then run File > Open
+    /// from behind (invoke_menu's route; never in front). One per-process
+    /// lease covers both, so no other input to Finder lands between them.
+    /// `Ok`: the open was sent (it is never sent again another way). `Err`:
+    /// why nothing was opened, for the AXOpen fallback.
+    async fn open_finder_item_from_behind(
+        &self,
+        args: &Value,
+        pid: i32,
+        wid: u32,
+        idx: usize,
+        element_guard: crate::ax::snapshot::RetainedElement,
+        lease: &super::BackgroundMutationLease,
+    ) -> Result<String, String> {
+        use cua_driver_core::tool::Tool;
+        let mut click_args = args.clone();
+        if let Some(map) = click_args.as_object_mut() {
+            map.remove("delivery_mode");
+        }
+        let click = super::click::ClickTool::new(self.state.clone());
+        crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async move {
+            let selected = click.invoke(click_args).await;
+            let said = selected
+                .content
+                .iter()
+                .find_map(|content| match content {
+                    cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if selected.is_error == Some(true) {
+                return Err(format!("selecting the item from behind failed ({said})"));
+            }
+            let alone = crate::background_mutation::spawn_blocking(move || {
+                crate::input::ax_actions::RowSelection::capture(element_guard.as_ptr())
+                    .and_then(|row| row.observe())
+                    .is_some_and(|readback| readback.exclusive())
+            })
+            .await
+            .unwrap_or(false);
+            if !alone {
+                return Err(
+                    "the item could not be read back as Finder's only selection after the click, so File > Open could open something else"
+                        .into(),
+                );
+            }
+            let path = FINDER_OPEN.iter().map(|segment| (*segment).to_owned()).collect();
+            let opened = super::invoke_menu::press_from_behind_only(pid, wid, path).await?;
+            Ok(format!(
+                "Opened element [{idx}] from behind: selected it (the only selection), then ran Finder's File > Open from behind instead of AXOpen, which raises Finder's window. {opened}"
+            ))
+        })
+        .await
     }
 }
 
@@ -102,13 +185,15 @@ impl Tool for DoubleClickTool {
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
             let probe_guard = element_guard.clone();
-            let has_ax_open = tokio::task::spawn_blocking(move || unsafe {
-                copy_action_names(probe_guard.as_ptr() as AXUIElementRef)
-                    .iter()
-                    .any(|action| action == "AXOpen")
+            let (has_ax_open, role) = tokio::task::spawn_blocking(move || unsafe {
+                let element = probe_guard.as_ptr() as AXUIElementRef;
+                (
+                    copy_action_names(element).iter().any(|action| action == "AXOpen"),
+                    crate::ax::bindings::copy_string_attr(element, "AXRole").unwrap_or_default(),
+                )
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or((false, String::new()));
             let _mutation_lease = if !delivery_mode.is_foreground() {
                 let action = background_action_for_element(has_ax_open);
                 match super::gate_background_window_action(pid, wid, Some(element_ptr), action)
@@ -120,6 +205,27 @@ impl Tool for DoubleClickTool {
             } else {
                 None
             };
+
+            // A Finder item opens from behind (File > Open) where it can; AXOpen
+            // runs only when that route did not send anything, and says why.
+            let mut not_from_behind = None;
+            if let Some(lease) = _mutation_lease.as_ref().filter(|_| {
+                opens_from_behind(
+                    delivery_mode.is_foreground(),
+                    has_ax_open,
+                    crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder"),
+                    &role,
+                    crate::apps::frontmost_pid().is_some_and(|front| front != pid),
+                )
+            }) {
+                match self
+                    .open_finder_item_from_behind(&args, pid, wid, idx, element_guard.clone(), lease)
+                    .await
+                {
+                    Ok(text) => return ToolResult::text(text),
+                    Err(why) => not_from_behind = Some(why),
+                }
+            }
 
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
@@ -149,7 +255,12 @@ impl Tool for DoubleClickTool {
             .await;
 
             return match result {
-                Ok(Ok(msg)) => ToolResult::text(msg),
+                Ok(Ok(msg)) => ToolResult::text(match not_from_behind {
+                    Some(why) => format!(
+                        "{msg} It was opened with AXOpen because the open from behind (select, then File > Open) could not run: {why}."
+                    ),
+                    None => msg,
+                }),
                 Ok(Err(e)) => ToolResult::error(format!("double_click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -410,6 +521,22 @@ fn ax_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_finder_item_opens_from_behind_only_while_another_app_is_in_front() {
+        // icon view, list and column view names
+        assert!(opens_from_behind(false, true, true, "AXImage", true));
+        assert!(opens_from_behind(false, true, true, "AXTextField", true));
+        // Finder in front: nothing to raise above, AXOpen as before
+        assert!(!opens_from_behind(false, true, true, "AXImage", false));
+        // a sidebar cell, or any other role
+        assert!(!opens_from_behind(false, true, true, "AXCell", true));
+        assert!(!opens_from_behind(false, true, true, "AXRow", true));
+        // other apps, no AXOpen, the foreground rung
+        assert!(!opens_from_behind(false, true, false, "AXImage", true));
+        assert!(!opens_from_behind(false, false, true, "AXImage", true));
+        assert!(!opens_from_behind(true, true, true, "AXImage", true));
+    }
 
     #[test]
     fn background_element_route_does_not_guess_across_actuator_classes() {

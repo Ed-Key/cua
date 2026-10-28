@@ -312,7 +312,12 @@ pub(crate) async fn gate_background_window_action(
     Ok(lease)
 }
 
+/// A nested call (double_click selecting through the click tool) reuses the
+/// lease its caller holds for `pid`.
 pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationLease {
+    if let Some(guard) = crate::background_mutation::held_guard(pid) {
+        return BackgroundMutationLease { pid, _guard: guard };
+    }
     BackgroundMutationLease {
         pid,
         _guard: Arc::new(crate::background_mutation::acquire(pid).await),
@@ -321,6 +326,26 @@ pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationL
 
 #[cfg(test)]
 mod background_mutation_lifetime_tests {
+    #[tokio::test]
+    async fn a_nested_call_reuses_the_lease_its_caller_holds() {
+        let pid = -91_311;
+        let lease = super::acquire_background_mutation(pid).await;
+        let nested = crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                super::acquire_background_mutation(pid),
+            )
+            .await
+        })
+        .await;
+        assert!(nested.is_ok(), "a nested acquire waited on its own caller's lease");
+        drop(nested);
+        // Outside the held scope the lease is still exclusive.
+        assert!(crate::background_mutation::try_acquire(pid).is_err());
+        drop(lease);
+        assert!(crate::background_mutation::try_acquire(pid).is_ok());
+    }
+
     #[tokio::test]
     async fn cancelled_async_caller_does_not_unlock_a_running_blocking_actuator() {
         let pid = -91_310;

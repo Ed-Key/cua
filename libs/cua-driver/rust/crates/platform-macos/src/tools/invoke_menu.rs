@@ -1257,6 +1257,44 @@ fn after_background(outcome: Background, restore: impl FnOnce() -> bool) -> Resu
     }
 }
 
+/// What a press from behind only ends with: `Ok` with the call's words once
+/// the item was pressed (also when the press returned an error or nothing
+/// showed: the caller must not run the command another way), `Err` with why
+/// it was not pressed.
+fn behind_only(outcome: Background, restore: impl FnOnce() -> bool) -> Result<String, String> {
+    after_background(outcome, restore).map(|ran| summary(&ran))
+}
+
+/// Run the final item of `path` from behind and never in front, for a tool
+/// that has a route of its own when this one cannot run (double_click opens
+/// a Finder item with File > Open). Holds the per-process lease (or reuses
+/// the caller's) and the foreground turn, as [`InvokeMenuTool`] does.
+pub(crate) async fn press_from_behind_only(
+    pid: i32,
+    window_id: u32,
+    path: Vec<String>,
+) -> Result<String, String> {
+    let mutation = if crate::background_mutation::held_by_current_task(pid) {
+        None
+    } else {
+        Some(crate::background_mutation::acquire(pid).await)
+    };
+    tokio::task::spawn_blocking(move || {
+        let _mutation = mutation;
+        let _turn = crate::input::mouse::foreground_turn().map_err(|busy| busy.to_string())?;
+        let prior = crate::apps::frontmost_pid()
+            .filter(|prior| *prior != pid)
+            .ok_or_else(|| "the app is in front (or no other app is)".to_owned())?;
+        let restore = || {
+            crate::apps::confirm_front(prior)
+                || (crate::apps::restore_prior_app(prior) && crate::apps::confirm_front(prior))
+        };
+        behind_only(press_in_background(pid, window_id, &path, prior), restore)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("the press from behind did not run ({error})")))
+}
+
 fn summary(ran: &Ran) -> String {
     match ran {
         Ran::Background {
@@ -2081,6 +2119,23 @@ mod tests {
         assert!(
             text.contains("AX error -25204") && text.contains("the app's windows changed"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_press_from_behind_only_counts_once_sent_whatever_it_showed() {
+        let keys = || Press::Keys { key: "o".into(), modifiers: vec!["cmd"] };
+        for outcome in [
+            pressed(vec![], false, None),
+            pressed(vec![], false, Some("AX error -25200")),
+            Background::Pressed { press: keys(), changed: vec![], lasted: false, activated: false, error: None },
+            Background::Pressed { press: keys(), changed: vec!["the app's windows"], lasted: true, activated: true, error: None },
+        ] {
+            assert!(behind_only(outcome, || true).is_ok(), "a sent press must end the call");
+        }
+        assert_eq!(
+            behind_only(Background::skipped("the app has an inline edit open"), || true),
+            Err("the app has an inline edit open".to_owned())
         );
     }
 

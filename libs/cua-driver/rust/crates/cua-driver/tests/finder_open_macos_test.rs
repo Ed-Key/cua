@@ -116,6 +116,52 @@ fn click_open_on_a_finder_folder_opens_it_and_reports_success() {
     });
 }
 
+fn front_app_name() -> String {
+    let asn = Command::new("lsappinfo").arg("front").output().expect("lsappinfo front");
+    let asn = String::from_utf8_lossy(&asn.stdout).trim().to_owned();
+    let info = Command::new("lsappinfo").args(["info", "-only", "name", &asn]).output().expect("lsappinfo info");
+    String::from_utf8_lossy(&info.stdout).trim().rsplit('=').next().unwrap_or_default().trim_matches('"').to_owned()
+}
+
+/// With another app in front, double_click on a Finder folder opens it from
+/// behind (select, then File > Open by Cmd+O) instead of AXOpen, which raises
+/// Finder's window above that app in the bench image (item 43). The window
+/// navigates, the other app stays in front, and the result names the route.
+#[test]
+#[ignore]
+fn double_click_on_a_finder_folder_behind_another_app_opens_it_from_behind() {
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("macos-finder-open-behind")
+        .expect("start installed macOS daemon proxy");
+    let folder = folder_with_subfolder("behind");
+    assert!(Command::new("open").arg(folder.root.path()).status().expect("open folder in Finder").success());
+    let (pid, window_id) = finder_window(&mut driver, &folder.name);
+    let token = inner_icon_token(&mut driver, pid, window_id);
+    assert!(Command::new("open").args(["-a", "Calculator"]).status().expect("open Calculator").success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while front_app_name() != "Calculator" {
+        assert!(Instant::now() < deadline, "Calculator did not come to the front");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let result = driver.call(
+        "double_click",
+        serde_json::json!({"pid": pid, "window_id": window_id, "element_token": token}),
+    );
+    assert!(!result.is_error(), "opening a Finder folder from behind failed: {}", result.text());
+    assert!(
+        result.text().contains("from behind") && !result.text().contains("AXOpen performed"),
+        "double_click did not open the folder from behind: {}",
+        result.text()
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while window_title(&mut driver, window_id).as_deref() != Some("Inner") {
+        assert!(Instant::now() < deadline, "the Finder window did not navigate into Inner");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(front_app_name(), "Calculator", "the open brought another app to the front");
+    let _ = Command::new("pkill").args(["-x", "Calculator"]).status();
+}
+
 /// The icon's state in a fresh snapshot with a screenshot: whether Finder
 /// reports it selected, and its centre in that screenshot's pixels.
 fn note_icon(driver: &mut McpDriver, pid: u64, window_id: u64) -> (bool, f64, f64) {
