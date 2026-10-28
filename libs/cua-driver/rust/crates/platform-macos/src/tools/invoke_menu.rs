@@ -547,6 +547,26 @@ fn opens_editor_by_shortcut(key: &str, modifiers: &[&'static str]) -> bool {
         && (modifiers.contains(&"shift") || modifiers.contains(&"ctrl"))
 }
 
+/// Whether `path` is one of Finder's commands that open an inline editor:
+/// by its English title, or by its shortcut (New Folder in any language).
+fn item_opens_editor(pid: i32, path: &[String]) -> bool {
+    opens_inline_editor(path)
+        || unsafe {
+            let Ok(item) = closed_menu_item(pid, path) else {
+                return false;
+            };
+            let keys = key_equivalent(
+                crate::ax::bindings::copy_string_attr_checked(item, "AXMenuItemCmdChar")
+                    .ok()
+                    .as_deref(),
+                shortcut_virtual_key(item),
+                shortcut_modifiers(item),
+            );
+            CFRelease(item as CFTypeRef);
+            keys.is_some_and(|(key, modifiers)| opens_editor_by_shortcut(&key, &modifiers))
+        }
+}
+
 /// Whether a special key sent from behind reaches the menu rather than the
 /// focused control: not when the focus is a text control, or unreadable.
 fn special_key_reaches_menu(focused_role: Option<&str>) -> bool {
@@ -555,11 +575,12 @@ fn special_key_reaches_menu(focused_role: Option<&str>) -> bool {
     })
 }
 
-/// The role of `pid`'s focused element (its subrole when that is
-/// AXSearchField), `None` when it could not be read.
-fn focused_role(pid: i32) -> Option<String> {
+/// The role of the focused element of `pid`'s window `window_id` (its
+/// subrole when that is AXSearchField), `None` when it could not be read or
+/// the focus is in another window.
+fn focused_role(pid: i32, window_id: u32) -> Option<String> {
     unsafe {
-        let element = crate::ax::bindings::focused_element_of_pid(pid)?;
+        let element = crate::ax::exact_target::focused_element_in_window(pid, window_id)?;
         let role = copy_string_attr(element, "AXRole");
         let search = copy_string_attr(element, "AXSubrole").as_deref() == Some("AXSearchField");
         CFRelease(element as CFTypeRef);
@@ -786,13 +807,13 @@ fn shortcut_refused(pid: i32, window_id: u32) -> Option<String> {
 /// Move to Trash ran in front, over the user's app, and from there failed).
 fn front_route_for_inline_edit(
     saves_on_end_editing: bool,
-    path: &[String],
+    opens_editor: impl FnOnce() -> bool,
     edit_open: impl FnOnce() -> Option<bool>,
 ) -> Option<&'static str> {
     if !saves_on_end_editing {
         return None;
     }
-    if opens_inline_editor(path) {
+    if opens_editor() {
         return Some(
             "the command opens an inline editor (Rename, New Folder), and this app ends an inline edit when it loses the front, so it runs in front",
         );
@@ -817,7 +838,7 @@ const BACKGROUND_VERDICT_AFTER: Duration = Duration::from_millis(400);
 fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) -> Background {
     if let Some(why) = front_route_for_inline_edit(
         crate::tools::edit_commit::app_saves_on_end_editing(pid),
-        path,
+        || item_opens_editor(pid, path),
         || crate::ax::bindings::inline_edit_state(pid),
     ) {
         return Background::skipped(why);
@@ -843,16 +864,7 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                 Ok(press) => press,
                 Err(why) => return Background::skipped(why),
             };
-            if let Press::Keys { key, modifiers } = &press {
-                // A Finder editor command in another language (its English
-                // title is not matched): known by its shortcut.
-                if crate::tools::edit_commit::app_saves_on_end_editing(pid)
-                    && opens_editor_by_shortcut(key, modifiers)
-                {
-                    return Background::skipped(
-                        "the command's shortcut is the one that opens a new folder's inline editor, and this app ends an inline edit when it loses the front, so it runs in front",
-                    );
-                }
+            if let Press::Keys { key, .. } = &press {
                 // AX names the shortcut by character; the key sent is the US
                 // position of that character, which another layout may put
                 // elsewhere (Z and W swap on AZERTY: Undo would close).
@@ -901,19 +913,20 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                             .to_owned(),
                     ));
                 }
+                let first = read();
+                std::thread::sleep(BACKGROUND_POLL);
+                let before = first.steady(&read());
                 // A text field takes a special key (Cmd+Delete deletes to
-                // the line start) before a menu item that reads disabled.
+                // the line start) before a menu item that reads disabled:
+                // the window's own focus is read right before the press.
                 if matches!(&press, Press::Keys { key, .. } if !layout_check_applies(key))
-                    && !special_key_reaches_menu(focused_role(pid).as_deref())
+                    && !special_key_reaches_menu(focused_role(pid, window_id).as_deref())
                 {
                     return Ok(Err(
                         "the window's focus is a text field (or could not be read), which takes a special key such as Delete as editing before the menu does"
                             .to_owned(),
                     ));
                 }
-                let first = read();
-                std::thread::sleep(BACKGROUND_POLL);
-                let before = first.steady(&read());
                 pressed_at = Some(std::time::Instant::now());
                 // An error says whether the press was made anyway: an AX
                 // press was sent (menu items can report an error and still
@@ -1458,7 +1471,7 @@ impl Tool for InvokeMenuTool {
                 && result.is_ok()
                 && crate::tools::edit_commit::app_saves_on_end_editing(pid)
                 && {
-                    let expected = opens_inline_editor(&path);
+                    let expected = item_opens_editor(pid, &path);
                     let wait = if expected { EXPECTED_INLINE_EDIT_WAIT } else { INLINE_EDIT_WAIT };
                     crate::ax::bindings::await_inline_edit_after_menu(pid, window_id, wait, expected)
                 };
@@ -1694,15 +1707,20 @@ mod tests {
     fn finders_other_menu_commands_are_tried_from_behind() {
         let path = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let trash = path(&["File", "Move to Trash"]);
-        assert_eq!(front_route_for_inline_edit(true, &trash, || Some(false)), None);
-        assert_eq!(front_route_for_inline_edit(true, &path(&["Edit", "Copy"]), || Some(false)), None);
-        assert!(front_route_for_inline_edit(true, &path(&["File", "New Folder"]), || Some(false)).is_some());
-        assert!(front_route_for_inline_edit(true, &path(&["File", "Rename"]), || Some(false)).is_some());
+        let route = |p: Vec<String>, open: Option<bool>| {
+            front_route_for_inline_edit(true, || opens_inline_editor(&p), || open)
+        };
+        assert_eq!(route(trash.clone(), Some(false)), None);
+        assert_eq!(route(path(&["Edit", "Copy"]), Some(false)), None);
+        assert!(route(path(&["File", "New Folder"]), Some(false)).is_some());
+        assert!(route(path(&["File", "Rename"]), Some(false)).is_some());
+        // A localized New Folder, known by its shortcut.
+        assert!(front_route_for_inline_edit(true, || true, || Some(false)).is_some());
         // An edit open now, or a focus that did not read: today's route.
-        assert!(front_route_for_inline_edit(true, &trash, || Some(true)).is_some());
-        assert!(front_route_for_inline_edit(true, &trash, || None).is_some());
-        // Other apps are never held to it, and the focus is not even read.
-        assert_eq!(front_route_for_inline_edit(false, &path(&["File", "Rename"]), || panic!("read")), None);
+        assert!(route(trash.clone(), Some(true)).is_some());
+        assert!(route(trash, None).is_some());
+        // Other apps are never held to it, and nothing is read.
+        assert_eq!(front_route_for_inline_edit(false, || panic!("item"), || panic!("focus")), None);
     }
 
     #[test]
