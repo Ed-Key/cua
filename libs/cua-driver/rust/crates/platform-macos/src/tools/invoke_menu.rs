@@ -1279,7 +1279,9 @@ pub(crate) async fn press_from_behind_only(
     } else {
         Some(crate::background_mutation::acquire(pid).await)
     };
-    tokio::task::spawn_blocking(move || {
+    // The worker keeps the lease (its own, or the caller's it reuses) when
+    // the call is cancelled: background_mutation::spawn_blocking carries it.
+    crate::background_mutation::spawn_blocking(move || {
         let _mutation = mutation;
         let _turn = crate::input::mouse::foreground_turn().map_err(|busy| busy.to_string())?;
         let prior = crate::apps::frontmost_pid()

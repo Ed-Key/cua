@@ -153,6 +153,13 @@ fn double_click_on_a_finder_folder_behind_another_app_opens_it_from_behind() {
         "double_click did not open the folder from behind: {}",
         result.text()
     );
+    // The press from behind reports an activation during the command (the
+    // app came to the front by itself) even when the front is restored after.
+    assert!(
+        result.text().contains("the app was not brought to the front"),
+        "Finder came to the front during the open: {}",
+        result.text()
+    );
     let deadline = Instant::now() + Duration::from_secs(3);
     while window_title(&mut driver, window_id).as_deref() != Some("Inner") {
         assert!(Instant::now() < deadline, "the Finder window did not navigate into Inner");
