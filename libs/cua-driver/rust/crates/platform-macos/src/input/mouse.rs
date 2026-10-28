@@ -676,10 +676,12 @@ pub fn foreground_turn() -> Result<ForegroundTurn, ForegroundBusy> {
     Ok(turn)
 }
 
-/// [`foreground_turn`] without the user-typing wait, for the background
-/// keyboard route's own focus preparation: its keys are addressed to the
-/// target process and never take the user's.
-pub(crate) fn background_focus_turn() -> Result<ForegroundTurn, ForegroundBusy> {
+/// [`foreground_turn`] without the user-typing wait, for routes that do not
+/// put a window in front of the user: the background keyboard route's focus
+/// preparation (its keys are addressed to the target process), a launch from
+/// behind, and invoke_menu's attempt from behind (its foreground fallback
+/// waits itself).
+pub(crate) fn turn_without_user_wait() -> Result<ForegroundTurn, ForegroundBusy> {
     admit(&FOREGROUND, TURN_WAIT, click_in_flight, UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2)
 }
 

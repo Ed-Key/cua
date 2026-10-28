@@ -337,7 +337,10 @@ pub(crate) enum KeyRole {
 /// [`KeyScope`] (desktop scope: the front app is the target by contract) it
 /// is posted as is.
 pub(crate) fn post_hid_key(event: &CGEvent, role: KeyRole) -> anyhow::Result<()> {
-    super::user_activity::note_own_hid_key();
+    // The user-typing guard reads the last key-down: only presses are cua's.
+    if matches!(role, KeyRole::Press) {
+        super::user_activity::note_own_hid_key();
+    }
     let Some(recipient) = CURRENT.with(|c| c.borrow().clone()) else {
         event.post(CGEventTapLocation::HID);
         return Ok(());

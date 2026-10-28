@@ -298,7 +298,7 @@ impl HostController {
         // The preparation brings the host forward and restores the original:
         // an activation, so it passes the foreground admission and holds the
         // turn through the restore.
-        let _turn = crate::input::mouse::background_focus_turn()?;
+        let _turn = crate::input::mouse::turn_without_user_wait()?;
         let started = Instant::now();
         let _operation = self
             .operation

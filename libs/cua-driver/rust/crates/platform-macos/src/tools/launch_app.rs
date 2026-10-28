@@ -227,7 +227,7 @@ impl Tool for LaunchAppTool {
                     // A launched app can bring itself forward; while a click
                     // cua posted may still be held by an event tap, its late
                     // release would land there. Held for the launch call.
-                    let _turn = crate::input::mouse::foreground_turn()?;
+                    let _turn = crate::input::mouse::turn_without_user_wait()?;
                     // Read again after the admission: while it waited, another
                     // worker's action may have changed the front.
                     let prior_frontmost = crate::apps::frontmost_pid();
