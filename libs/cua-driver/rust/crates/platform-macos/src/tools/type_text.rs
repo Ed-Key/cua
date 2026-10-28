@@ -1791,7 +1791,7 @@ enum Began {
 /// | Page | the page itself | keys (they reach its focused element), character line break |
 /// | Page | a field (the page reported it once its window took key focus) | keys, line break from that field's role if web is Yes |
 /// | Page | a control (button, select-only combo) | refused |
-/// | Unread | a field | keys, character line break |
+/// | Unread (nothing retained) | a field | keys, character line break |
 /// | Unread | anything else | refused |
 /// | (web No) | anything | keys, as before item 42 |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1808,7 +1808,9 @@ impl TypingDecision {
     /// `chromium`: the process is Chromium-family (Chrome, Electron), the
     /// only one whose unreadable ancestry is taken as possibly web content;
     /// elsewhere it stays native, as before item 42.
-    fn settle(proven: bool, classification: WebAreaClassification, role: &str, chromium: bool) -> Self {
+    /// `retained`: the read-back retained a target (an unreadable role then
+    /// still counts as a specific field, never as no target).
+    fn settle(proven: bool, classification: WebAreaClassification, role: &str, chromium: bool, retained: bool) -> Self {
         let web = if proven || classification == WebAreaClassification::WebContent {
             Web::Yes
         } else if classification == WebAreaClassification::NonWebContent || !chromium {
@@ -1817,8 +1819,8 @@ impl TypingDecision {
             Web::Unknown
         };
         let began = match role {
-            "" => Began::Unread,
             "AXWebArea" => Began::Page,
+            "" if !retained => Began::Unread,
             _ => Began::Field,
         };
         Self { web, began, line_breaks: line_breaks_for(web == Web::Yes, role) }
@@ -2337,6 +2339,7 @@ fn type_text_blocking(
             classification,
             &readback.role(),
             crate::ax::enablement::chromium_family_cached(pid),
+            target.is_some(),
         )
     };
     let addressed_web_field = element_ptr_and_idx.is_some() && decision.web_rules();
@@ -3154,24 +3157,25 @@ mod tests {
     fn the_web_decision_rows() {
         use crate::input::keyboard::LineBreaks;
         use WebAreaClassification::*;
-        let d = TypingDecision::settle(false, WebContent, "AXTextArea", true);
+        let d = TypingDecision::settle(false, WebContent, "AXTextArea", true, true);
         assert_eq!((d.web, d.began, d.line_breaks), (Web::Yes, Began::Field, LineBreaks::ShiftReturn));
         assert!(d.web_rules());
-        let d = TypingDecision::settle(false, WebContent, "AXTextField", true);
+        let d = TypingDecision::settle(false, WebContent, "AXTextField", true, true);
         assert_eq!(d.line_breaks, LineBreaks::Characters, "a single-line page field");
-        let d = TypingDecision::settle(true, Incomplete, "AXTextArea", true);
+        let d = TypingDecision::settle(true, Incomplete, "AXTextArea", true, true);
         assert_eq!((d.web, d.line_breaks), (Web::Yes, LineBreaks::ShiftReturn), "a proven Electron token");
-        let d = TypingDecision::settle(false, NonWebContent, "AXTextArea", true);
+        let d = TypingDecision::settle(false, NonWebContent, "AXTextArea", true, true);
         assert_eq!((d.web, d.line_breaks), (Web::No, LineBreaks::Characters));
         assert!(!d.web_rules(), "a native field keeps the AX write and its retryable count");
         for unknown in [Incomplete, WindowFocusUnavailable] {
-            let d = TypingDecision::settle(false, unknown, "AXTextArea", true);
+            let d = TypingDecision::settle(false, unknown, "AXTextArea", true, true);
             assert_eq!((d.web, d.line_breaks), (Web::Unknown, LineBreaks::Characters));
             assert!(d.web_rules(), "unknown takes the safe side: keys, no retryable count");
         }
-        assert_eq!(TypingDecision::settle(false, WebContent, "AXWebArea", true).began, Began::Page);
-        assert_eq!(TypingDecision::settle(false, Incomplete, "AXTextArea", false).web, Web::No, "another app's unreadable ancestry stays native");
-        assert_eq!(TypingDecision::settle(false, Incomplete, "", true).began, Began::Unread);
+        assert_eq!(TypingDecision::settle(false, WebContent, "AXWebArea", true, true).began, Began::Page);
+        assert_eq!(TypingDecision::settle(false, Incomplete, "AXTextArea", false, true).web, Web::No, "another app's unreadable ancestry stays native");
+        assert_eq!(TypingDecision::settle(false, Incomplete, "", true, false).began, Began::Unread);
+        assert_eq!(TypingDecision::settle(false, WebContent, "", true, true).began, Began::Field, "a retained field whose role read failed");
     }
 
     /// Item 42, second table of [`TypingDecision`]: the last check before
@@ -3180,10 +3184,10 @@ mod tests {
     fn the_last_check_rows() {
         use crate::input::keyboard::LineBreaks::*;
         use WebAreaClassification::*;
-        let field = TypingDecision::settle(false, WebContent, "AXTextArea", true);
-        let page = TypingDecision::settle(false, WebContent, "AXWebArea", true);
-        let unread = TypingDecision::settle(false, Incomplete, "", true);
-        let native = TypingDecision::settle(false, NonWebContent, "AXTextArea", true);
+        let field = TypingDecision::settle(false, WebContent, "AXTextArea", true, true);
+        let page = TypingDecision::settle(false, WebContent, "AXWebArea", true, true);
+        let unread = TypingDecision::settle(false, Incomplete, "", true, false);
+        let native = TypingDecision::settle(false, NonWebContent, "AXTextArea", true, true);
         let k = LastCheck::Keys;
         // began on a field
         assert_eq!(last_check(field, true, Some(true), "AXTextArea", false), k(ShiftReturn));
@@ -3967,7 +3971,7 @@ mod tests {
                 settle_ms,
                 std::time::Instant::now(),
                 true,
-                TypingDecision::settle(true, WebAreaClassification::WebContent, "AXTextArea", true),
+                TypingDecision::settle(true, WebAreaClassification::WebContent, "AXTextArea", true, true),
             );
             let case = format!("{role} settle {settle_ms}");
             let error = result.err().unwrap_or_else(|| panic!("{case}: must refuse"));
