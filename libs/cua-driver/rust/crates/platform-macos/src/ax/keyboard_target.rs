@@ -54,6 +54,12 @@ pub(crate) fn with_keyboard_recipient<T>(
     )
 }
 
+/// The view service that hosts the focused control of `window_id` (an Open
+/// or Save panel's service), if any: keys for that window are routed there.
+pub(crate) fn hosted_view_service(host_pid: i32, window_id: u32) -> Option<i32> {
+    remote_recipient(host_pid, &read_focused(host_pid, window_id)?)
+}
+
 /// Repeat the proof after a caller's final focus preparation, before its first post.
 pub(crate) fn validate_recipient(
     host_pid: i32,

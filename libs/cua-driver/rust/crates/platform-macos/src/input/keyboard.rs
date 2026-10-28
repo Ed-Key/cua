@@ -214,12 +214,12 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
         {
             continue;
         }
-        active_flags |= modifier_flag;
+        // The flags of a refused press are never carried by the releases.
         if let Err(error) = post_global_key(
             &source,
             modifier_code,
             true,
-            active_flags,
+            active_flags | modifier_flag,
             CGEventTapLocation::HID,
         ) {
             release_global_modifiers(
@@ -230,6 +230,7 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
             );
             return Err(error);
         }
+        active_flags |= modifier_flag;
         pressed_modifiers.push((modifier_code, modifier_flag));
         key_gap_sleep();
     }
@@ -288,17 +289,18 @@ pub(super) fn with_global_modifier_keys<T>(
         {
             continue;
         }
-        active_flags |= flag;
+        // The flags of a refused press are never carried by the releases.
         if let Err(error) = post_global_key(
             &source,
             key_code,
             true,
-            active_flags,
+            active_flags | flag,
             CGEventTapLocation::HID,
         ) {
             release_global_modifiers(&source, &pressed, active_flags, CGEventTapLocation::HID);
             return Err(error);
         }
+        active_flags |= flag;
         pressed.push((key_code, flag));
         key_gap_sleep();
     }
@@ -318,8 +320,23 @@ fn post_global_key(
     let event = CGEvent::new_keyboard_event(source.clone(), key_code, key_down)
         .map_err(|_| anyhow::anyhow!("CGEvent keyboard event creation failed"))?;
     event.set_flags(flags);
-    event.post(tap);
-    Ok(())
+    post_key_event(&event, key_down, tap)
+}
+
+/// A HID key goes through the foreground key guard (it reaches the target
+/// or no one); any other tap location is posted as is.
+fn post_key_event(
+    event: &CGEvent,
+    key_down: bool,
+    tap: core_graphics::event::CGEventTapLocation,
+) -> anyhow::Result<()> {
+    use super::key_guard::{post_hid_key, KeyRole};
+    if matches!(tap, core_graphics::event::CGEventTapLocation::HID) {
+        post_hid_key(event, if key_down { KeyRole::Press } else { KeyRole::Release })
+    } else {
+        event.post(tap);
+        Ok(())
+    }
 }
 
 fn release_global_modifiers(
@@ -332,7 +349,7 @@ fn release_global_modifiers(
         active_flags.remove(flag);
         if let Ok(event) = CGEvent::new_keyboard_event(source.clone(), key_code, false) {
             event.set_flags(active_flags);
-            event.post(tap);
+            let _ = post_key_event(&event, false, tap);
         }
         key_gap_sleep();
     }
@@ -423,13 +440,13 @@ pub fn type_text_global(
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
         down.set_string(&value);
         down.set_flags(CGEventFlags::CGEventFlagNull);
-        down.post(CGEventTapLocation::HID);
+        post_key_event(&down, true, CGEventTapLocation::HID)?;
         key_gap_sleep();
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&value);
         up.set_flags(CGEventFlags::CGEventFlagNull);
-        up.post(CGEventTapLocation::HID);
+        post_key_event(&up, false, CGEventTapLocation::HID)?;
         std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
         Ok(())
     })
@@ -449,7 +466,6 @@ pub fn type_text_physical_global(
     inter_char_delay_ms: u64,
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<usize> {
-    use core_graphics::event::CGEventTapLocation;
     // Global HID input: not under another worker's foreground action.
     let _turn = crate::input::mouse::hold_foreground_turn()?;
 
@@ -462,12 +478,11 @@ pub fn type_text_physical_global(
     post_until(event_groups, deadline, |events| {
         let native_events = events
             .iter()
-            .map(|event| create_bare_keyboard_event(event.key_code, event.key_down))
+            .map(|event| {
+                Ok((event.key_code, event.key_down, create_bare_keyboard_event(event.key_code, event.key_down)?))
+            })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        for cg_event in native_events {
-            cg_event.post(CGEventTapLocation::HID);
-            key_gap_sleep();
-        }
+        post_hid_sequence(native_events)?;
         let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
         if !extra.is_zero() {
             std::thread::sleep(extra);
@@ -484,7 +499,6 @@ pub fn type_text_physical_global(
 /// the modifier downs would otherwise send the base key without its modifiers
 /// (Cmd+V typed a plain "v" on every foreground attempt in the VM lab).
 pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    use core_graphics::event::CGEventTapLocation;
     // Global HID input: not under another worker's foreground action.
     let _turn = crate::input::mouse::hold_foreground_turn()?;
 
@@ -510,14 +524,42 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
             if let Some(flags) = flags {
                 event.set_flags(flags);
             }
-            Ok(event)
+            Ok((code, down, event))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    for event in events {
-        event.post(CGEventTapLocation::HID);
+    post_hid_sequence(events)
+}
+
+/// Post a sequence of key transitions on the HID queue in order. Once a
+/// press is refused (see [`super::key_guard`]), only the releases of keys
+/// already down follow: no key is left held and no partial chord goes on.
+fn post_hid_sequence(events: Vec<(u16, bool, CGEvent)>) -> anyhow::Result<()> {
+    post_sequence(events, |event, down| {
+        let posted = post_key_event(event, down, core_graphics::event::CGEventTapLocation::HID);
         key_gap_sleep();
+        posted
+    })
+}
+
+fn post_sequence<E>(
+    events: Vec<(u16, bool, E)>,
+    mut post: impl FnMut(&E, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut held: Vec<u16> = Vec::new();
+    let mut refused: Option<anyhow::Error> = None;
+    for (code, down, event) in events {
+        if refused.is_some() && (down || !held.contains(&code)) {
+            continue;
+        }
+        match post(&event, down) {
+            Ok(()) if down => held.push(code),
+            Ok(()) => held.retain(|held| *held != code),
+            Err(error) => {
+                refused.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    refused.map_or(Ok(()), Err)
 }
 
 /// The chord's transitions with the flags each event should carry. A base key
@@ -1032,6 +1074,26 @@ fn unknown_key_message(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 38: once a key of a chord is refused (its target lost the
+    /// front), nothing more of the chord is pressed and every key already
+    /// down is released, so no partial chord lands and no modifier is left
+    /// held. Cmd+Shift+A refused at A: only Shift up and Cmd up follow.
+    #[test]
+    fn a_refused_press_ends_the_chord_with_only_the_held_releases() {
+        let chord = bare_chord_transitions(0, None, &[(55, CGEventFlags::CGEventFlagCommand), (56, CGEventFlags::CGEventFlagShift)]);
+        let events: Vec<(u16, bool, u16)> = chord.iter().map(|(code, down, _)| (*code, *down, *code)).collect();
+        let mut sent = Vec::new();
+        let result = post_sequence(events, |code, down| {
+            if *code == 0 && down {
+                anyhow::bail!("refused");
+            }
+            sent.push((*code, down));
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(sent, vec![(55, true), (56, true), (56, false), (55, false)]);
+    }
 
     #[test]
     fn spelled_out_punctuation_names_resolve_to_us_keys() {

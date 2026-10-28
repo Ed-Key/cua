@@ -1053,11 +1053,14 @@ pub fn with_foreground_assist(
     // may activate or post meanwhile, and an earlier click still held by an
     // event tap would land on this target.
     let _turn = crate::input::mouse::foreground_turn()?;
+    // Any HID key the body posts reaches the target or no one, and the
+    // front goes back only after it was routed.
+    let keys = crate::input::key_guard::KeyScope::open(target_pid, target_wid);
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {
             // SPIs unavailable — run body anyway without activation.
-            body()?;
+            settled(&keys, body())?;
             return Ok(false);
         }
     };
@@ -1072,7 +1075,7 @@ pub fn with_foreground_assist(
 
     let mut target_psn = [0u8; 8];
     if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        body()?;
+        settled(&keys, body())?;
         return Ok(false);
     }
 
@@ -1086,7 +1089,7 @@ pub fn with_foreground_assist(
     );
     if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
     {
-        body()?;
+        settled(&keys, body())?;
         return Ok(true);
     }
 
@@ -1100,10 +1103,11 @@ pub fn with_foreground_assist(
     focus_exact_window(target_pid, target_wid);
     settle_attached_sheet(target_pid, target_wid);
 
-    let result = body();
+    let result = settled(&keys, body());
 
     if prev_ok
         && !click_may_be_in_flight(&result)
+        && !keys_on_their_way(&result)
         && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before)
     {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
@@ -1257,6 +1261,9 @@ pub fn with_foreground_hid_activation<T>(
     // The foreground turn, held through the restore below (see
     // `with_foreground_assist`).
     let _turn = crate::input::mouse::foreground_turn()?;
+    // Every HID key of the action reaches the target or no one, and the
+    // user's app gets the front back only after each one was routed.
+    let keys = crate::input::key_guard::KeyScope::open(target_pid, target_wid);
 
     let mut prev_psn = [0u8; 8];
     let prev_ok = get_front_process_fn()
@@ -1281,7 +1288,7 @@ pub fn with_foreground_hid_activation<T>(
         // renderer focus even though WindowServer keeps the app frontmost.
         // The AX window proof lets us deliver directly without weakening the
         // exact-window guard or disturbing the current key target.
-        return action();
+        return settled(&keys, action());
     }
 
     // This activation is the point of the call: the action's suppression
@@ -1308,15 +1315,44 @@ pub fn with_foreground_hid_activation<T>(
 
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
+    let result = settled(&keys, result);
 
     if prev_ok
         && !click_may_be_in_flight(&result)
+        && !keys_on_their_way(&result)
         && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before)
     {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
     result
+}
+
+/// The action's result once every HID key it posted was routed: a press that
+/// went astray (withheld from the other app) makes a successful action an
+/// error, and keys still on their way win over any other error, because the
+/// hand-back must not run then ([`keys_on_their_way`]).
+fn settled<T>(
+    keys: &crate::input::key_guard::KeyScope,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    use crate::input::key_guard::KeyRefusal;
+    match keys.settle() {
+        Err(unsettled @ KeyRefusal::Unsettled { .. }) => Err(unsettled.into()),
+        routed => {
+            let value = result?;
+            routed?;
+            Ok(value)
+        }
+    }
+}
+
+/// Keys of this action are still unrouted: handing the front back now would
+/// route them into the user's app, so the target stays in front.
+fn keys_on_their_way<T>(result: &anyhow::Result<T>) -> bool {
+    result.as_ref().err().and_then(|e| e.downcast_ref::<crate::input::key_guard::KeyRefusal>()).is_some_and(
+        |refusal| matches!(refusal, crate::input::key_guard::KeyRefusal::Unsettled { .. }),
+    )
 }
 
 /// A foreground pointer event was not sent because another window stays
