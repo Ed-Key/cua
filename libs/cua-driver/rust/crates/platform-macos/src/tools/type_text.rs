@@ -1986,7 +1986,9 @@ fn cgevent_type_verified(
         match untargeted_web_target(pid, readback, settle_ms == 0) {
             UntargetedWeb::Refuse => return Err(WebFieldNotFocused.into()),
             UntargetedWeb::Keys(mode) => line_breaks = mode,
-            UntargetedWeb::NotWeb => {}
+            // Not proven web content at the last moment: no Shift+Return,
+            // which a single-line page field would take as a submit.
+            UntargetedWeb::NotWeb => line_breaks = crate::input::keyboard::LineBreaks::Characters,
         }
     }
     let posted = crate::input::keyboard::type_text_with_delay(
