@@ -620,7 +620,8 @@ impl std::fmt::Display for ForegroundBusy {
                  bringing a window forward now would take their keystrokes, so nothing was activated \
                  or sent. Use the background route instead (the same call without \
                  delivery_mode:\"foreground\", by element_token or x,y), or retry once the user has \
-                 stopped typing",
+                 stopped typing. (This check runs before a foreground action starts; typing that \
+                 begins during one still reaches its target.)",
                 typed_ago.as_secs_f64(),
                 waited.as_millis()
             ),

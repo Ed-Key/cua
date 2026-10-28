@@ -9,6 +9,11 @@
 //! waits up to [`WAIT`] for [`QUIET`] without typing, then refuses with
 //! [`super::mouse::ForegroundBusy::UserActive`]: nothing activated or sent.
 //!
+//! This is a check before admission only: keys the user starts typing after
+//! the target came to the front still reach it (the foreground key scope's
+//! tap passes untagged events). Protecting the whole foreground interval is
+//! a separate item.
+//!
 //! cua's own HID key posts update the same clock, so each one is noted
 //! ([`note_own_hid_key`]); a key-down whose age matches the last own post is
 //! taken as cua's. A user key within [`OWN_MATCH`] of an own post is missed.
