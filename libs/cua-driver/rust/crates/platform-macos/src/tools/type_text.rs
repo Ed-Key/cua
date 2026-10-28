@@ -1738,28 +1738,44 @@ fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usiz
     Some(((screen_x - frame.bounds.x) * frame.scale, (screen_y - frame.bounds.y) * frame.scale))
 }
 
-/// Whether the window's focus is still where untargeted keys were meant to
-/// go: the element focused when the call began, or, when that was the page
-/// itself, the field the page reports once its window takes key focus (the
-/// background preparation does that; an earlier click had already chosen
-/// the field).
-fn still_typing_target(pid: i32, original: AXUIElementRef, window_id: u32) -> bool {
-    if addressed_element_has_focus(pid, original, Some(window_id)) {
-        return true;
-    }
-    if unsafe { copy_string_attr(original, "AXRole") }.as_deref() != Some("AXWebArea") {
-        return false;
+enum UntargetedWeb {
+    NotWeb,
+    Refuse,
+    Keys(crate::input::keyboard::LineBreaks),
+}
+
+/// See the untargeted check in [`cgevent_type_verified`].
+fn untargeted_web_target(pid: i32, readback: &TypingReadback, background: bool) -> UntargetedWeb {
+    if let Some(wid) = readback.window_id {
+        crate::ax::enablement::refresh_page(pid, wid);
     }
     unsafe {
-        let Some(now) = crate::ax::exact_target::focused_element_in_window(pid, window_id) else {
-            return false;
+        let current = match readback.window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => focused_element_of_pid(pid),
         };
-        let role = copy_string_attr(now, "AXRole").unwrap_or_default();
-        let editable = crate::ax::bindings::copy_element_attr(now, "AXEditableAncestor")
+        let Some(current) = current else {
+            return UntargetedWeb::NotWeb;
+        };
+        let class = classify_target_web_area(pid, Some((current as usize, None)), readback.window_id);
+        let role = copy_string_attr(current, "AXRole").unwrap_or_default();
+        let editable = crate::ax::bindings::copy_element_attr(current, "AXEditableAncestor")
             .map(|e| CFRelease(e as CFTypeRef))
             .is_some();
-        CFRelease(now as CFTypeRef);
-        takes_text(&role, editable)
+        let began_here_or_on_page = readback.focused.as_ref().is_none_or(|original| {
+            CFEqual(original.as_CFTypeRef(), current as CFTypeRef) != 0
+                || copy_string_attr(original.as_CFTypeRef() as AXUIElementRef, "AXRole").as_deref()
+                    == Some("AXWebArea")
+        });
+        CFRelease(current as CFTypeRef);
+        if class != WebAreaClassification::WebContent {
+            return UntargetedWeb::NotWeb;
+        }
+        let page = role == "AXWebArea";
+        if background && !page && !(takes_text(&role, editable) && began_here_or_on_page) {
+            return UntargetedWeb::Refuse;
+        }
+        UntargetedWeb::Keys(line_breaks_for(class, &role))
     }
 }
 
@@ -1943,18 +1959,18 @@ fn cgevent_type_verified(
             return Err(WebFieldNotFocused.into());
         }
     }
-    // Untargeted keys into web content go to the field that was focused when
-    // the call began, or nowhere: a page that moved its focus meanwhile (to a
-    // control that would act on them) gets no key (item 42). Background only:
-    // fronting the window moves its focus by design.
-    if let (0, None, Some(focused), Some(wid)) =
-        (settle_ms, element_ptr_and_idx, readback.focused.as_ref(), readback.window_id)
-    {
-        if target_in_web_area(pid, None, Some(wid)) {
-            crate::ax::enablement::refresh_page(pid, wid);
-            if !still_typing_target(pid, focused.as_CFTypeRef() as AXUIElementRef, wid) {
-                return Err(WebFieldNotFocused.into());
-            }
+    // Untargeted keys into web content: judged from the element that holds
+    // focus right now (refreshed), which is where the keys will go (item 42).
+    // From behind they need a field that takes text, the same one the call
+    // began with (or, when it began with the page itself, the field the page
+    // reports now); the page itself keeps today's keys. The line-break mode
+    // follows that element.
+    let mut line_breaks = line_breaks;
+    if element_ptr_and_idx.is_none() {
+        match untargeted_web_target(pid, readback, settle_ms == 0) {
+            UntargetedWeb::Refuse => return Err(WebFieldNotFocused.into()),
+            UntargetedWeb::Keys(mode) => line_breaks = mode,
+            UntargetedWeb::NotWeb => {}
         }
     }
     let posted = crate::input::keyboard::type_text_with_delay(
