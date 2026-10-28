@@ -539,6 +539,34 @@ fn special_key_name(virtual_key: i64) -> Option<&'static str> {
     SPECIAL_KEYS.iter().find(|(code, _)| *code == virtual_key).map(|(_, name)| *name)
 }
 
+/// Whether a menu shortcut is Finder's New Folder (Cmd+Shift+N) or New
+/// Folder with Selection (Ctrl+Cmd+N), whatever the menu language.
+fn opens_editor_by_shortcut(key: &str, modifiers: &[&'static str]) -> bool {
+    key == "n"
+        && modifiers.contains(&"cmd")
+        && (modifiers.contains(&"shift") || modifiers.contains(&"ctrl"))
+}
+
+/// Whether a special key sent from behind reaches the menu rather than the
+/// focused control: not when the focus is a text control, or unreadable.
+fn special_key_reaches_menu(focused_role: Option<&str>) -> bool {
+    focused_role.is_some_and(|role| {
+        !matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox" | "AXSearchField")
+    })
+}
+
+/// The role of `pid`'s focused element (its subrole when that is
+/// AXSearchField), `None` when it could not be read.
+fn focused_role(pid: i32) -> Option<String> {
+    unsafe {
+        let element = crate::ax::bindings::focused_element_of_pid(pid)?;
+        let role = copy_string_attr(element, "AXRole");
+        let search = copy_string_attr(element, "AXSubrole").as_deref() == Some("AXSearchField");
+        CFRelease(element as CFTypeRef);
+        if search { Some("AXSearchField".into()) } else { role }
+    }
+}
+
 /// Whether the key sent for a shortcut must first be proven to type its
 /// character in the current layout: only character keys; a special key is
 /// the same key in every layout.
@@ -815,7 +843,16 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                 Ok(press) => press,
                 Err(why) => return Background::skipped(why),
             };
-            if let Press::Keys { key, .. } = &press {
+            if let Press::Keys { key, modifiers } = &press {
+                // A Finder editor command in another language (its English
+                // title is not matched): known by its shortcut.
+                if crate::tools::edit_commit::app_saves_on_end_editing(pid)
+                    && opens_editor_by_shortcut(key, modifiers)
+                {
+                    return Background::skipped(
+                        "the command's shortcut is the one that opens a new folder's inline editor, and this app ends an inline edit when it loses the front, so it runs in front",
+                    );
+                }
                 // AX names the shortcut by character; the key sent is the US
                 // position of that character, which another layout may put
                 // elsewhere (Z and W swap on AZERTY: Undo would close).
@@ -861,6 +898,16 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                 {
                     return Ok(Err(
                         "the window's focus could not be proven to be outside web content, which can take the item's shortcut before the menu does"
+                            .to_owned(),
+                    ));
+                }
+                // A text field takes a special key (Cmd+Delete deletes to
+                // the line start) before a menu item that reads disabled.
+                if matches!(&press, Press::Keys { key, .. } if !layout_check_applies(key))
+                    && !special_key_reaches_menu(focused_role(pid).as_deref())
+                {
+                    return Ok(Err(
+                        "the window's focus is a text field (or could not be read), which takes a special key such as Delete as editing before the menu does"
                             .to_owned(),
                     ));
                 }
@@ -1614,6 +1661,23 @@ mod tests {
         assert_eq!(key_equivalent(Some("\u{8}"), None, Some(0.0)), None);
         // A printable character wins over the virtual key.
         assert_eq!(keys(Some("C"), 8, 0.0), Some(("c".into(), vec!["cmd"])));
+    }
+
+    /// Review round 1: a focused text field takes Cmd+Delete as editing when
+    /// the menu item reads disabled; a localized New Folder is known by its
+    /// shortcut.
+    #[test]
+    fn a_special_key_is_not_sent_into_a_text_field() {
+        assert!(special_key_reaches_menu(Some("AXList")));
+        assert!(special_key_reaches_menu(Some("AXOutline")));
+        for text in ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"] {
+            assert!(!special_key_reaches_menu(Some(text)), "{text}");
+        }
+        assert!(!special_key_reaches_menu(None));
+        assert!(opens_editor_by_shortcut("n", &["cmd", "shift"]));
+        assert!(opens_editor_by_shortcut("n", &["cmd", "ctrl"]));
+        assert!(!opens_editor_by_shortcut("n", &["cmd"]));
+        assert!(!opens_editor_by_shortcut("d", &["cmd", "shift"]));
     }
 
     #[test]
