@@ -222,9 +222,9 @@ fn chromium_family_cached(pid: i32) -> bool {
 
 const REFRESH_BUDGET: Duration = Duration::from_millis(250);
 const REFRESH_PROBE_NODES: u32 = 60;
-/// Time for the page to publish after the request (measured in VM B,
-/// item 42: the tree was current at the first read after it).
-const REFRESH_SETTLE: Duration = Duration::from_millis(60);
+/// Time for the page to publish after the request (VM B, item 42: the
+/// covered fixture's value changed 2 to 27 ms after it, 4 rounds).
+const REFRESH_SETTLE: Duration = Duration::from_millis(40);
 
 /// Bring a Chromium-family window's page accessibility tree up to date
 /// before it is read. Chromium treats the page of a fully covered window as
