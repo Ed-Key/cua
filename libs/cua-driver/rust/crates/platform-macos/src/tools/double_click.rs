@@ -77,44 +77,63 @@ fn token_refused(structured: Option<&Value>) -> bool {
     })
 }
 
-/// The title and value a snapshot row shows (its rendered line, see
-/// ax::tree::format_node_line: `- [idx] ROLE "title" = "value" ...`).
-// ponytail: a title that itself holds `" [`, `" (` or `" = ` is cut there
-// and then matches nothing, which refuses (the safe side).
-fn row_title_and_value(row: &str) -> (Option<String>, Option<String>) {
-    let line = row.split('\u{1}').next().unwrap_or_default();
-    let Some(rest) = line.strip_prefix("- ") else {
-        return (None, None);
-    };
-    let rest = match rest.strip_prefix('[') {
-        Some(indexed) => indexed.split_once("] ").map_or("", |(_, rest)| rest),
-        None => rest,
-    };
-    // The role is one word.
-    let mut rest = rest.split_once(' ').map_or("", |(_, rest)| rest);
-    let mut title = None;
-    if let Some(quoted) = rest.strip_prefix('"') {
-        let end = quoted.match_indices('"').map(|(at, _)| at).find(|&at| {
-            let after = &quoted[at + 1..];
-            after.is_empty() || [" = ", " [", " ("].iter().any(|next| after.starts_with(next))
-        });
-        if let Some(end) = end {
-            title = Some(quoted[..end].to_owned());
-            rest = &quoted[end + 1..];
-        }
-    }
-    let value = rest.strip_prefix(" = ").and_then(|json| {
-        serde_json::Deserializer::from_str(json).into_iter::<String>().next()?.ok()
-    });
-    (title, value)
+/// The identity fields of an element as its snapshot row renders them
+/// (ax::tree::format_node_line): ` "title"`, ` = value`, ` [placeholder=..]`,
+/// ` (description)`, from live reads, with the walk's trimming rules.
+struct Identity {
+    title: Option<String>,
+    value: Option<String>,
+    placeholder: Option<String>,
+    description: Option<String>,
 }
 
-/// Whether the snapshot row shows exactly `name` as its title or value. No
-/// row known: nothing to compare against.
-fn row_names_exactly(row: Option<&str>, name: &str) -> bool {
+impl Identity {
+    fn read(element: AXUIElementRef, role: &str) -> Self {
+        let read = |attribute| unsafe { crate::ax::bindings::copy_string_attr(element, attribute) };
+        let trimmed = |text: Option<String>| text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+        let value = unsafe { crate::ax::bindings::copy_stringish_attr(element, "AXValue") }
+            .and_then(|copied| copied.string_value)
+            .filter(|v| !v.trim().is_empty() || crate::ax::tree::is_text_entry_role(role));
+        Identity {
+            title: trimmed(read("AXTitle")),
+            value,
+            placeholder: read("AXPlaceholderValue").filter(|hint| !hint.trim().is_empty()),
+            description: trimmed(read("AXDescription")),
+        }
+    }
+
+    fn rendered(&self) -> String {
+        let mut out = String::new();
+        if let Some(t) = &self.title {
+            out.push_str(&format!(" \"{t}\""));
+        }
+        if let Some(v) = &self.value {
+            out.push_str(&format!(" = {}", serde_json::json!(v)));
+        }
+        if let Some(p) = &self.placeholder {
+            out.push_str(&format!(" [placeholder={}]", serde_json::json!(p)));
+        }
+        if let Some(d) = &self.description {
+            out.push_str(&format!(" ({d})"));
+        }
+        out
+    }
+}
+
+/// Whether a snapshot row (`- [idx] ROLE` and the identity fields, then the
+/// bracketed id, help, actions and state block) shows exactly these identity
+/// fields: the row is this prefix, then that block or nothing. No row known:
+/// nothing to compare against.
+fn row_shows(row: Option<&str>, idx: usize, role: &str, identity: &Identity) -> bool {
     row.is_none_or(|row| {
-        let (title, value) = row_title_and_value(row);
-        title.as_deref() == Some(name) || value.as_deref() == Some(name)
+        let line = row.split('\u{1}').next().unwrap_or_default();
+        let prefix = format!("- [{idx}] {role}{}", identity.rendered());
+        line.strip_prefix(&prefix).is_some_and(|rest| {
+            rest.is_empty()
+                || [" [id=", " [help=", " [actions=", " [selected", " [focused", " [value="]
+                    .iter()
+                    .any(|block| rest.starts_with(block))
+        })
     })
 }
 
@@ -150,6 +169,7 @@ impl DoubleClickTool {
         wid: u32,
         idx: usize,
         element_guard: crate::ax::snapshot::RetainedElement,
+        role: &str,
         snapshot_row: Option<String>,
         lease: &super::BackgroundMutationLease,
     ) -> Result<String, NotFromBehind> {
@@ -173,7 +193,14 @@ impl DoubleClickTool {
         })?;
         // The name the snapshot showed for this element: a list that refreshed
         // after the snapshot can have handed the element to another item.
-        if !row_names_exactly(snapshot_row.as_deref(), &asked) {
+        let identity_guard = element_guard.clone();
+        let identity_role = role.to_owned();
+        let identity = crate::background_mutation::spawn_blocking(move || {
+            Identity::read(identity_guard.as_ptr() as AXUIElementRef, &identity_role)
+        })
+        .await
+        .ok();
+        if !identity.is_some_and(|identity| row_shows(snapshot_row.as_deref(), idx, role, &identity)) {
             return Err(NotFromBehind::Refuse(format!(
                 "element [{idx}] now names {asked:?}, not what the snapshot showed; the app reused it for other content. Nothing was sent. Take a fresh snapshot"
             )));
@@ -383,6 +410,7 @@ impl Tool for DoubleClickTool {
                         wid,
                         idx,
                         element_guard.clone(),
+                        &role,
                         snapshot_row.clone(),
                         lease,
                     )
@@ -696,19 +724,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_snapshot_row_must_show_the_whole_name() {
+    fn the_snapshot_row_must_show_exactly_the_items_identity() {
+        let named = |title: &str, description: Option<&str>| Identity {
+            title: Some(title.into()),
+            value: None,
+            placeholder: None,
+            description: description.map(Into::into),
+        };
         let icon = "- [50] AXImage \"Draft (Q3) Copy\" (Draft (Q3) Copy) [id=Draft (Q3) Copy actions=[open,show_menu]]\u{1}None";
-        assert!(row_names_exactly(Some(icon), "Draft (Q3) Copy"));
+        assert!(row_shows(Some(icon), 50, "AXImage", &named("Draft (Q3) Copy", Some("Draft (Q3) Copy"))));
         for part in ["Q3", "Draft", "Copy", "Draft (Q3)"] {
-            assert!(!row_names_exactly(Some(icon), part), "{part} matched");
+            assert!(!row_shows(Some(icon), 50, "AXImage", &named(part, Some(part))), "{part} matched");
         }
-        let field = "- [74] AXTextField = \"Report \\\"Q3\\\".txt\" [actions=[open,show_menu,confirm]]";
-        assert!(row_names_exactly(Some(field), "Report \"Q3\".txt"));
-        assert!(!row_names_exactly(Some(field), "Q3"));
-        let both = "- [9] AXTextField \"\" = \"note.txt\" [actions=[open]]";
-        assert!(row_names_exactly(Some(both), "note.txt"));
-        assert!(!row_names_exactly(Some("- [3] AXCell [actions=[open]]"), "note.txt"));
-        assert!(row_names_exactly(None, "anything"));
+        // Another index or role is another row.
+        assert!(!row_shows(Some(icon), 51, "AXImage", &named("Draft (Q3) Copy", Some("Draft (Q3) Copy"))));
+        // A title that holds a quote and a bracket does not match its first part.
+        let tricky = "- [5] AXImage \"Draft\" [old\" [actions=[open]]";
+        assert!(!row_shows(Some(tricky), 5, "AXImage", &named("Draft", None)));
+        assert!(row_shows(Some(tricky), 5, "AXImage", &named("Draft\" [old", None)));
+        let field = "- [74] AXTextField = \"Report \\\"Q3\\\".txt\" [actions=[open,show_menu,confirm] selected]";
+        let valued = |value: &str| Identity { title: None, value: Some(value.into()), placeholder: None, description: None };
+        assert!(row_shows(Some(field), 74, "AXTextField", &valued("Report \"Q3\".txt")));
+        assert!(!row_shows(Some(field), 74, "AXTextField", &valued("Q3")));
+        assert!(row_shows(None, 1, "AXImage", &valued("anything")));
     }
 
     #[test]
