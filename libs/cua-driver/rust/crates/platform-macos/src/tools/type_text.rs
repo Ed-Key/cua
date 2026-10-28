@@ -1762,20 +1762,33 @@ fn untargeted_web_target(pid: i32, readback: &TypingReadback, background: bool) 
         let editable = crate::ax::bindings::copy_element_attr(current, "AXEditableAncestor")
             .map(|e| CFRelease(e as CFTypeRef))
             .is_some();
-        let began_here_or_on_page = readback.focused.as_ref().is_none_or(|original| {
-            CFEqual(original.as_CFTypeRef(), current as CFTypeRef) != 0
-                || copy_string_attr(original.as_CFTypeRef() as AXUIElementRef, "AXRole").as_deref()
-                    == Some("AXWebArea")
+        // What the call began with: a specific element (the keys must still
+        // go to it), or the page itself / nothing readable (any field it
+        // reports now will do).
+        let began_on = readback.focused.as_ref().and_then(|original| {
+            let role = copy_string_attr(original.as_CFTypeRef() as AXUIElementRef, "AXRole");
+            (role.as_deref() != Some("AXWebArea"))
+                .then(|| CFEqual(original.as_CFTypeRef(), current as CFTypeRef) != 0)
         });
         CFRelease(current as CFTypeRef);
         if class != WebAreaClassification::WebContent {
             return UntargetedWeb::NotWeb;
         }
-        let page = role == "AXWebArea";
-        if background && !page && !(takes_text(&role, editable) && began_here_or_on_page) {
+        if background && !untargeted_web_keys_allowed(&role, editable, began_on) {
             return UntargetedWeb::Refuse;
         }
         UntargetedWeb::Keys(line_breaks_for(class, &role))
+    }
+}
+
+/// Whether untargeted background keys may go to the web element focused now
+/// (`role`, `editable`): `began_on` is `Some(still the same)` when the call
+/// began with a specific element focused, `None` when it began with the page
+/// itself or no readable focus.
+fn untargeted_web_keys_allowed(role: &str, editable: bool, began_on: Option<bool>) -> bool {
+    match began_on {
+        Some(same) => same && takes_text(role, editable),
+        None => role == "AXWebArea" || takes_text(role, editable),
     }
 }
 
@@ -2999,6 +3012,21 @@ mod tests {
         assert!(!takes_text("AXGroup", false));
         assert!(!takes_text("AXComboBox", false), "a select-only menu button");
         assert!(takes_text("AXComboBox", true));
+    }
+
+    /// Item 42: untargeted keys from behind go to the field the call began
+    /// with, or, when it began with the page focused, to the page or a field;
+    /// never to a control, a different field, or a page that took the focus
+    /// away from the field.
+    #[test]
+    fn untargeted_web_keys_follow_the_field_the_call_began_with() {
+        assert!(untargeted_web_keys_allowed("AXTextArea", false, Some(true)));
+        assert!(!untargeted_web_keys_allowed("AXTextArea", false, Some(false)), "another field");
+        assert!(!untargeted_web_keys_allowed("AXWebArea", false, Some(false)), "the field lost focus to the page");
+        assert!(!untargeted_web_keys_allowed("AXComboBox", false, Some(true)), "a select-only control");
+        assert!(untargeted_web_keys_allowed("AXWebArea", false, None));
+        assert!(untargeted_web_keys_allowed("AXTextArea", false, None));
+        assert!(!untargeted_web_keys_allowed("AXButton", false, None));
     }
 
     /// Item 42: a line break into a multi-line web field is Shift+Return;
