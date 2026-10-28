@@ -559,6 +559,7 @@ impl Tool for TypeTextTool {
                             keyboard_policy: blocking_policy,
                             prepare_native_text,
                             deadline,
+                            proven_web_field: electron_field.is_some(),
                         },
                     )
                 })
@@ -2136,6 +2137,10 @@ struct KeyboardRoute {
     prepare_native_text: bool,
     /// When key posting must stop (see [`posting_deadline`]).
     deadline: std::time::Instant,
+    /// The addressed element was proven an Electron page field before its
+    /// focus click: delivery keeps the web-field rules (keys only, focus
+    /// proofs) even if a later ancestry read fails.
+    proven_web_field: bool,
 }
 
 /// Best-effort-background ladder for `type_text`.
@@ -2164,6 +2169,7 @@ fn type_text_blocking(
         keyboard_policy,
         prepare_native_text,
         deadline,
+        proven_web_field,
     } = route;
     // The worker can start after the deadline (the async side checked it
     // before its last await): then nothing is sent, on any route.
@@ -2204,8 +2210,8 @@ fn type_text_blocking(
     // An addressed field in web content: its keys are guarded by a focus
     // proof on either route. A token-addressed Electron field reaches here
     // only after its pixel focus was proven (item 42).
-    let addressed_web_field =
-        element_ptr_and_idx.is_some() && target_in_web_area(pid, element_ptr_and_idx, window_id);
+    let addressed_web_field = element_ptr_and_idx.is_some()
+        && (proven_web_field || target_in_web_area(pid, element_ptr_and_idx, window_id));
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
     let line_breaks = line_breaks_for(
         classify_target_web_area(pid, element_ptr_and_idx, window_id),
@@ -2439,7 +2445,8 @@ fn type_text_blocking(
     // write into its contenteditable or textarea and inserts nothing (item 42).
     let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let web_page = target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let web_page = (proven_web_field && !owns)
+            || target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
         let keep = ax_text_write_first(&role, owns, web_page);
         if !keep && owns {
             unsafe { CFRelease(element as CFTypeRef) };
@@ -3513,6 +3520,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 prepare_native_text: false,
                 deadline: posting_deadline(),
+                proven_web_field: false,
             },
         );
         match r {
@@ -3542,6 +3550,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
                 deadline: posting_deadline(),
+                proven_web_field: false,
             },
         )
         .expect("accepted AX write must retain an uncertain outcome");
@@ -3590,6 +3599,7 @@ mod tests {
                     keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                     prepare_native_text: true,
                     deadline: posting_deadline(),
+                    proven_web_field: false,
                 },
             )
             .expect("a Catalyst target is decided before any input");
@@ -3650,6 +3660,7 @@ mod tests {
                     keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                     prepare_native_text: true,
                     deadline: posting_deadline(),
+                    proven_web_field: false,
                 },
             )
             .expect("the key rung's budget refusal");
@@ -3878,6 +3889,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
                 deadline: posting_deadline(),
+                proven_web_field: false,
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");
@@ -3954,6 +3966,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
                 deadline: std::time::Instant::now(),
+                proven_web_field: false,
             },
         )
         .expect("the stop must not touch the invalid pid");
