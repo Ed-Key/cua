@@ -480,19 +480,22 @@ impl Press {
 
 /// An item's key equivalent as the hotkey tool names keys: AX gives the
 /// character (upper case for letters) and modifier bits (1 shift, 2 option,
-/// 4 control, 8 no command; `None` when they could not be read). Only single-character equivalents; glyph keys
-/// (arrows, delete) are not tried.
+/// 4 control, 8 no command; `None` when they could not be read). A special
+/// key (Delete, Return, an arrow) has a control character or none, and AX
+/// names it by its virtual key: Finder's Move to Trash is U+0008 with
+/// virtual key 51, Cmd+Delete. Never a bare key: at least one modifier.
 fn key_equivalent(
     character: Option<&str>,
+    virtual_key: Option<i64>,
     flags: Option<f64>,
 ) -> Option<(String, Vec<&'static str>)> {
-    let mut chars = character?.chars();
-    let (Some(c), None) = (chars.next(), chars.next()) else {
-        return None;
+    let mut chars = character.unwrap_or_default().chars();
+    let key = match (chars.next(), chars.next()) {
+        (Some(c), None) if !c.is_whitespace() && !c.is_control() => c.to_lowercase().to_string(),
+        (Some(c), None) if c.is_control() => special_key_name(virtual_key?)?.to_owned(),
+        (None, _) => special_key_name(virtual_key?)?.to_owned(),
+        _ => return None,
     };
-    if c.is_whitespace() || c.is_control() {
-        return None;
-    }
     let flags = flags?;
     if !(0.0..16.0).contains(&flags) || flags.fract() != 0.0 {
         return None;
@@ -511,7 +514,36 @@ fn key_equivalent(
     if flags & 4 != 0 {
         modifiers.push("ctrl");
     }
-    (!modifiers.is_empty()).then(|| (c.to_lowercase().to_string(), modifiers))
+    (!modifiers.is_empty()).then_some((key, modifiers))
+}
+
+/// The key names (as press_key reads them) of the special keys a menu item's
+/// virtual key can name. Their positions do not move with the layout.
+const SPECIAL_KEYS: &[(i64, &str)] = &[
+    (36, "return"),
+    (48, "tab"),
+    (51, "delete"),
+    (53, "escape"),
+    (115, "home"),
+    (116, "pageup"),
+    (117, "forward_delete"),
+    (119, "end"),
+    (121, "pagedown"),
+    (123, "left"),
+    (124, "right"),
+    (125, "down"),
+    (126, "up"),
+];
+
+fn special_key_name(virtual_key: i64) -> Option<&'static str> {
+    SPECIAL_KEYS.iter().find(|(code, _)| *code == virtual_key).map(|(_, name)| *name)
+}
+
+/// Whether the key sent for a shortcut must first be proven to type its
+/// character in the current layout: only character keys; a special key is
+/// the same key in every layout.
+fn layout_check_applies(key: &str) -> bool {
+    !SPECIAL_KEYS.iter().any(|(_, name)| *name == key)
 }
 
 /// Whether the key sent for a shortcut character types that character in
@@ -535,6 +567,16 @@ unsafe fn shortcut_modifiers(item: AXUIElementRef) -> Option<f64> {
         ) => Some(0.0),
         Err(_) => None,
     }
+}
+
+/// The item's `AXMenuItemCmdVirtualKey`, `None` when it has none or the read
+/// failed.
+unsafe fn shortcut_virtual_key(item: AXUIElementRef) -> Option<i64> {
+    use core_foundation::number::CFNumber;
+    crate::ax::bindings::copy_attribute_checked(item, "AXMenuItemCmdVirtualKey")
+        .ok()?
+        .downcast::<CFNumber>()
+        .and_then(|number| number.to_i64())
 }
 
 /// Which press to make from behind. A closed menu's items were last checked
@@ -708,6 +750,30 @@ fn shortcut_refused(pid: i32, window_id: u32) -> Option<String> {
     None
 }
 
+/// Why a menu command of an app that ends an inline edit when it loses the
+/// front (Finder) runs in front without a try from behind, if it does: the
+/// command opens such an editor (Rename, New Folder), which needs the app in
+/// front, or one is open now (or that could not be read), which a press from
+/// behind could end. Every other command is tried from behind (item 41:
+/// Move to Trash ran in front, over the user's app, and from there failed).
+fn front_route_for_inline_edit(
+    saves_on_end_editing: bool,
+    path: &[String],
+    edit_open: impl FnOnce() -> Option<bool>,
+) -> Option<&'static str> {
+    if !saves_on_end_editing {
+        return None;
+    }
+    if opens_inline_editor(path) {
+        return Some(
+            "the command opens an inline editor (Rename, New Folder), and this app ends an inline edit when it loses the front, so it runs in front",
+        );
+    }
+    (edit_open() != Some(false)).then_some(
+        "this app has an inline edit open (or its focus could not be read), and it ends an inline edit when it loses the front, so its menu commands run in front until the edit ends",
+    )
+}
+
 /// The earliest a press from behind is judged: an app that activates itself
 /// for a command does it within this, and the activation log needs the
 /// notification.
@@ -721,13 +787,12 @@ const BACKGROUND_VERDICT_AFTER: Duration = Duration::from_millis(400);
 /// before it (nothing, when the command shows its effect later or not at
 /// all: it is still pressed, and is not pressed again).
 fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) -> Background {
-    // Finder ends a rename or a new folder's name field when it is not in
-    // front, so its menu commands keep today's route, which keeps it in
-    // front for that editor.
-    if crate::tools::edit_commit::app_saves_on_end_editing(pid) {
-        return Background::skipped(
-            "this app ends an inline edit (Rename, New Folder) when it loses the front, so its menu commands run in front",
-        );
+    if let Some(why) = front_route_for_inline_edit(
+        crate::tools::edit_commit::app_saves_on_end_editing(pid),
+        path,
+        || crate::ax::bindings::inline_edit_state(pid),
+    ) {
+        return Background::skipped(why);
     }
     unsafe {
         let item = match closed_menu_item(pid, path) {
@@ -742,6 +807,7 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                     crate::ax::bindings::copy_string_attr_checked(item, "AXMenuItemCmdChar")
                         .ok()
                         .as_deref(),
+                    shortcut_virtual_key(item),
                     shortcut_modifiers(item),
                 ),
             );
@@ -753,7 +819,8 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                 // AX names the shortcut by character; the key sent is the US
                 // position of that character, which another layout may put
                 // elsewhere (Z and W swap on AZERTY: Undo would close).
-                if !same_key_in_layout(key, crate::input::keyboard::layout_text_for(key).as_deref())
+                if layout_check_applies(key)
+                    && !same_key_in_layout(key, crate::input::keyboard::layout_text_for(key).as_deref())
                 {
                     return Background::skipped(
                         "the item's shortcut is not on the key this driver would send in the current keyboard layout",
@@ -1509,7 +1576,7 @@ mod tests {
     }
     #[test]
     fn a_key_equivalent_reads_ax_modifier_bits() {
-        let keys = |c: &str, flags: f64| key_equivalent(Some(c), Some(flags));
+        let keys = |c: &str, flags: f64| key_equivalent(Some(c), None, Some(flags));
         assert_eq!(keys("C", 0.0), Some(("c".into(), vec!["cmd"])));
         // Save As: shift and option on top of command.
         assert_eq!(
@@ -1522,13 +1589,56 @@ mod tests {
         assert_eq!(keys("A", 12.0), Some(("a".into(), vec!["ctrl"])));
         assert_eq!(keys("A", 8.0), None);
         // Unreadable or malformed modifiers: no shortcut is guessed.
-        assert_eq!(key_equivalent(Some("Z"), None), None);
+        assert_eq!(key_equivalent(Some("Z"), None, None), None);
         assert_eq!(keys("Z", 16.0), None);
         assert_eq!(keys("Z", 1.5), None);
         for none in ["", "AB", " ", "\u{7f}"] {
             assert_eq!(keys(none, 0.0), None, "{none:?}");
         }
-        assert_eq!(key_equivalent(None, Some(0.0)), None);
+        assert_eq!(key_equivalent(None, None, Some(0.0)), None);
+    }
+
+    /// Item 41: Finder's Move to Trash reads as U+0008 with virtual key 51
+    /// and Command (measured in VM B), and was never tried from behind.
+    #[test]
+    fn a_special_key_equivalent_is_read_from_its_virtual_key() {
+        let keys = |c: Option<&str>, vkey: i64, flags: f64| key_equivalent(c, Some(vkey), Some(flags));
+        assert_eq!(keys(Some("\u{8}"), 51, 0.0), Some(("delete".into(), vec!["cmd"])));
+        // Delete Immediately: Command and Option.
+        assert_eq!(keys(Some("\u{8}"), 51, 2.0), Some(("delete".into(), vec!["cmd", "option"])));
+        assert_eq!(keys(None, 126, 0.0), Some(("up".into(), vec!["cmd"])));
+        assert_eq!(keys(Some(""), 117, 1.0), Some(("forward_delete".into(), vec!["cmd", "shift"])));
+        // Never a bare key, never a key this driver cannot name.
+        assert_eq!(keys(Some("\u{8}"), 51, 8.0), None);
+        assert_eq!(keys(None, 200, 0.0), None);
+        assert_eq!(key_equivalent(Some("\u{8}"), None, Some(0.0)), None);
+        // A printable character wins over the virtual key.
+        assert_eq!(keys(Some("C"), 8, 0.0), Some(("c".into(), vec!["cmd"])));
+    }
+
+    #[test]
+    fn a_special_key_shortcut_needs_no_layout_check() {
+        assert!(!layout_check_applies("delete"));
+        assert!(!layout_check_applies("up"));
+        assert!(layout_check_applies("z"));
+        assert!(layout_check_applies(","));
+    }
+
+    /// Item 41: every Finder menu command ran in front, over the user's app,
+    /// although only the commands that open an inline editor need it.
+    #[test]
+    fn finders_other_menu_commands_are_tried_from_behind() {
+        let path = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let trash = path(&["File", "Move to Trash"]);
+        assert_eq!(front_route_for_inline_edit(true, &trash, || Some(false)), None);
+        assert_eq!(front_route_for_inline_edit(true, &path(&["Edit", "Copy"]), || Some(false)), None);
+        assert!(front_route_for_inline_edit(true, &path(&["File", "New Folder"]), || Some(false)).is_some());
+        assert!(front_route_for_inline_edit(true, &path(&["File", "Rename"]), || Some(false)).is_some());
+        // An edit open now, or a focus that did not read: today's route.
+        assert!(front_route_for_inline_edit(true, &trash, || Some(true)).is_some());
+        assert!(front_route_for_inline_edit(true, &trash, || None).is_some());
+        // Other apps are never held to it, and the focus is not even read.
+        assert_eq!(front_route_for_inline_edit(false, &path(&["File", "Rename"]), || panic!("read")), None);
     }
 
     #[test]
