@@ -67,6 +67,16 @@ fn renamed(idx: usize, asked: &str, now: Option<String>) -> NotFromBehind {
     ))
 }
 
+/// Whether the nested click refused the element itself: it now names other
+/// content than its snapshot row, or its token is stale (a newer snapshot).
+fn token_refused(structured: Option<&Value>) -> bool {
+    structured.is_some_and(|structured| {
+        structured.get("code").and_then(Value::as_str) == Some("element_changed")
+            || structured.pointer("/refusal/code").and_then(Value::as_str)
+                == Some("stale_element_token")
+    })
+}
+
 /// Why the open from behind did not run.
 enum NotFromBehind {
     /// Nothing was opened: AXOpen runs, and the result says why.
@@ -99,6 +109,7 @@ impl DoubleClickTool {
         wid: u32,
         idx: usize,
         element_guard: crate::ax::snapshot::RetainedElement,
+        snapshot_row: Option<String>,
         lease: &super::BackgroundMutationLease,
     ) -> Result<String, NotFromBehind> {
         use cua_driver_core::tool::Tool;
@@ -117,13 +128,6 @@ impl DoubleClickTool {
         .ok_or_else(|| NotFromBehind::AxOpen("the item's name could not be read".into()))?;
         // The name the snapshot showed for this element: a list that refreshed
         // after the snapshot can have handed the element to another item.
-        let snapshot_row = self
-            .state
-            .snapshots
-            .with_latest_payload(pid, u64::from(wid), |payload| {
-                payload.rows.indexed.get(&idx).map(|(_, signature)| signature.clone())
-            })
-            .flatten();
         if !super::click::still_names_row(snapshot_row.as_deref(), &asked) {
             return Err(NotFromBehind::Refuse(format!(
                 "element [{idx}] now names {asked:?}, not what the snapshot showed; the app reused it for other content. Nothing was sent. Take a fresh snapshot"
@@ -159,15 +163,11 @@ impl DoubleClickTool {
             if now.as_deref() != Some(asked.as_str()) {
                 return Err(renamed(idx, &asked, now));
             }
-            // The click compares the element with the snapshot's row: one the
-            // app reused for other content is not opened either.
-            let changed = selected
-                .structured_content
-                .as_ref()
-                .and_then(|structured| structured.get("code"))
-                .and_then(Value::as_str)
-                == Some("element_changed");
-            if changed {
+            // The click compares the element with the snapshot's row, and the
+            // token with the latest snapshot: an element the app reused for
+            // other content, or a token a newer snapshot replaced, is not
+            // opened either.
+            if token_refused(selected.structured_content.as_ref()) {
                 return Err(NotFromBehind::Refuse(said));
             }
             if selected.is_error == Some(true) {
@@ -273,6 +273,19 @@ impl Tool for DoubleClickTool {
             Ok(window_id) => window_id,
             Err(error) => return error,
         };
+        // The token's row as its snapshot showed it, read with the token: a
+        // newer snapshot later makes the token stale, which the nested click
+        // of the Finder route refuses.
+        let snapshot_row = match (element_index, window_id) {
+            (Some(idx), Some(wid)) => self
+                .state
+                .snapshots
+                .with_latest_payload(pid, u64::from(wid), |payload| {
+                    payload.rows.indexed.get(&idx).map(|(_, signature)| signature.clone())
+                })
+                .flatten(),
+            _ => None,
+        };
 
         // ── AX element path ──────────────────────────────────────────────────
         if let (Some(idx), Some(wid), Some(element_guard)) =
@@ -319,7 +332,15 @@ impl Tool for DoubleClickTool {
                 )
             }) {
                 match self
-                    .open_finder_item_from_behind(&args, pid, wid, idx, element_guard.clone(), lease)
+                    .open_finder_item_from_behind(
+                        &args,
+                        pid,
+                        wid,
+                        idx,
+                        element_guard.clone(),
+                        snapshot_row.clone(),
+                        lease,
+                    )
                     .await
                 {
                     Ok(text) => return ToolResult::text(text),
@@ -624,6 +645,16 @@ fn ax_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_click_that_refused_the_element_itself_is_not_followed_by_axopen() {
+        assert!(token_refused(Some(&serde_json::json!({"code": "element_changed", "effect": "refused"}))));
+        assert!(token_refused(Some(&serde_json::json!({
+            "status": "refused", "refusal": {"code": "stale_element_token", "message": "stale"}
+        }))));
+        assert!(!token_refused(Some(&serde_json::json!({"code": "background_refused"}))));
+        assert!(!token_refused(None));
+    }
 
     #[test]
     fn a_finder_item_opens_from_behind_only_while_another_app_is_in_front() {

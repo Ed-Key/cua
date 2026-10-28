@@ -652,16 +652,12 @@ fn choose_press(
     }
 }
 
-/// A caller that needs the item's key equivalent (an AX press of an item
-/// that reads disabled, or whose state could not be read, does nothing and
-/// still reads as sent) takes no AX press.
-fn keys_allowed(press: Press, keys_only: bool) -> Result<Press, &'static str> {
-    match press {
-        Press::Ax(_) if keys_only => Err(
-            "the item would be pressed through accessibility, and only its key equivalent is used for this command",
-        ),
-        press => Ok(press),
-    }
+/// The press for a caller that needs the item's key equivalent, whatever
+/// the item's enabled state reads (an AX press of an item that is disabled
+/// from behind does nothing and still reads as sent): its shortcut, or none.
+fn keys_press(keys: Option<(String, Vec<&'static str>)>) -> Result<Press, &'static str> {
+    keys.map(|(key, modifiers)| Press::Keys { key, modifiers })
+        .ok_or("the item has no key equivalent to send from behind")
 }
 
 /// How a press made from behind ended.
@@ -867,18 +863,23 @@ fn press_in_background(
             Err(why) => return Background::skipped(why),
         };
         let outcome = (|| {
-            let press = choose_press(
-                copy_bool_attr(item, "AXEnabled"),
-                choose_action(&copy_action_names(item), true),
-                key_equivalent(
-                    crate::ax::bindings::copy_string_attr_checked(item, "AXMenuItemCmdChar")
-                        .ok()
-                        .as_deref(),
-                    shortcut_virtual_key(item),
-                    shortcut_modifiers(item),
-                ),
+            let keys = key_equivalent(
+                crate::ax::bindings::copy_string_attr_checked(item, "AXMenuItemCmdChar")
+                    .ok()
+                    .as_deref(),
+                shortcut_virtual_key(item),
+                shortcut_modifiers(item),
             );
-            let press = match press.and_then(|press| keys_allowed(press, keys_only)) {
+            let press = if keys_only {
+                keys_press(keys)
+            } else {
+                choose_press(
+                    copy_bool_attr(item, "AXEnabled"),
+                    choose_action(&copy_action_names(item), true),
+                    keys,
+                )
+            };
+            let press = match press {
                 Ok(press) => press,
                 Err(why) => return Background::skipped(why),
             };
@@ -2147,11 +2148,14 @@ mod tests {
     }
 
     #[test]
-    fn a_keys_only_press_takes_no_accessibility_press() {
-        let keys = Press::Keys { key: "o".into(), modifiers: vec!["cmd"] };
-        assert_eq!(keys_allowed(keys.clone(), true), Ok(keys.clone()));
-        assert!(keys_allowed(Press::Ax("AXPress"), true).is_err());
-        assert_eq!(keys_allowed(Press::Ax("AXPress"), false), Ok(Press::Ax("AXPress")));
+    fn a_keys_only_press_is_the_shortcut_whatever_the_item_reads() {
+        // An item that reads enabled (or unreadable) with AXPress would get an
+        // AX press from choose_press; keys only takes its shortcut instead.
+        let cmd_o = || Some(("o".to_owned(), vec!["cmd"]));
+        assert_eq!(choose_press(Some(true), Some("AXPress"), cmd_o()), Ok(Press::Ax("AXPress")));
+        assert_eq!(choose_press(None, Some("AXPress"), cmd_o()), Ok(Press::Ax("AXPress")));
+        assert_eq!(keys_press(cmd_o()), Ok(Press::Keys { key: "o".into(), modifiers: vec!["cmd"] }));
+        assert!(keys_press(None).is_err());
     }
 
     #[test]
