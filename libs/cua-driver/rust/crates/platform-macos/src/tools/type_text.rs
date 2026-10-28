@@ -1738,6 +1738,31 @@ fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usiz
     Some(((screen_x - frame.bounds.x) * frame.scale, (screen_y - frame.bounds.y) * frame.scale))
 }
 
+/// Whether the window's focus is still where untargeted keys were meant to
+/// go: the element focused when the call began, or, when that was the page
+/// itself, the field the page reports once its window takes key focus (the
+/// background preparation does that; an earlier click had already chosen
+/// the field).
+fn still_typing_target(pid: i32, original: AXUIElementRef, window_id: u32) -> bool {
+    if addressed_element_has_focus(pid, original, Some(window_id)) {
+        return true;
+    }
+    if unsafe { copy_string_attr(original, "AXRole") }.as_deref() != Some("AXWebArea") {
+        return false;
+    }
+    unsafe {
+        let Some(now) = crate::ax::exact_target::focused_element_in_window(pid, window_id) else {
+            return false;
+        };
+        let role = copy_string_attr(now, "AXRole").unwrap_or_default();
+        let editable = crate::ax::bindings::copy_element_attr(now, "AXEditableAncestor")
+            .map(|e| CFRelease(e as CFTypeRef))
+            .is_some();
+        CFRelease(now as CFTypeRef);
+        takes_text(&role, editable)
+    }
+}
+
 /// Whether an element of `role` (with or without an editable ancestor) is a
 /// field that takes typed text.
 fn takes_text(role: &str, editable_ancestor: bool) -> bool {
@@ -1916,6 +1941,20 @@ fn cgevent_type_verified(
     if let (true, Some((ptr, _))) = (web_field, element_ptr_and_idx) {
         if !addressed_element_has_focus(pid, ptr as AXUIElementRef, readback.window_id) {
             return Err(WebFieldNotFocused.into());
+        }
+    }
+    // Untargeted keys into web content go to the field that was focused when
+    // the call began, or nowhere: a page that moved its focus meanwhile (to a
+    // control that would act on them) gets no key (item 42). Background only:
+    // fronting the window moves its focus by design.
+    if let (0, None, Some(focused), Some(wid)) =
+        (settle_ms, element_ptr_and_idx, readback.focused.as_ref(), readback.window_id)
+    {
+        if target_in_web_area(pid, None, Some(wid)) {
+            crate::ax::enablement::refresh_page(pid, wid);
+            if !still_typing_target(pid, focused.as_CFTypeRef() as AXUIElementRef, wid) {
+                return Err(WebFieldNotFocused.into());
+            }
         }
     }
     let posted = crate::input::keyboard::type_text_with_delay(
