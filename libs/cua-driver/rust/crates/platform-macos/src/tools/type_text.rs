@@ -1751,29 +1751,30 @@ fn untargeted_web_target(pid: i32, readback: &TypingReadback, background: bool) 
         crate::ax::enablement::refresh_page(pid, wid);
     }
     unsafe {
+        // A specific page field the call began with: the keys go to it or
+        // nowhere, so focus that is now unreadable or unproven is refused too.
+        let began_on_field = readback.focused.as_ref().filter(|original| {
+            let original = original.as_CFTypeRef() as AXUIElementRef;
+            copy_string_attr(original, "AXRole").as_deref() != Some("AXWebArea")
+                && classify_target_web_area(pid, Some((original as usize, None)), readback.window_id)
+                    == WebAreaClassification::WebContent
+        });
         let current = match readback.window_id {
             Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
             None => focused_element_of_pid(pid),
         };
         let Some(current) = current else {
-            return UntargetedWeb::NotWeb;
+            return if background && began_on_field.is_some() { UntargetedWeb::Refuse } else { UntargetedWeb::NotWeb };
         };
         let class = classify_target_web_area(pid, Some((current as usize, None)), readback.window_id);
         let role = copy_string_attr(current, "AXRole").unwrap_or_default();
         let editable = crate::ax::bindings::copy_element_attr(current, "AXEditableAncestor")
             .map(|e| CFRelease(e as CFTypeRef))
             .is_some();
-        // What the call began with: a specific element (the keys must still
-        // go to it), or the page itself / nothing readable (any field it
-        // reports now will do).
-        let began_on = readback.focused.as_ref().and_then(|original| {
-            let role = copy_string_attr(original.as_CFTypeRef() as AXUIElementRef, "AXRole");
-            (role.as_deref() != Some("AXWebArea"))
-                .then(|| CFEqual(original.as_CFTypeRef(), current as CFTypeRef) != 0)
-        });
+        let began_on = began_on_field.map(|original| CFEqual(original.as_CFTypeRef(), current as CFTypeRef) != 0);
         CFRelease(current as CFTypeRef);
         if class != WebAreaClassification::WebContent {
-            return UntargetedWeb::NotWeb;
+            return if background && began_on == Some(false) { UntargetedWeb::Refuse } else { UntargetedWeb::NotWeb };
         }
         if background && !untargeted_web_keys_allowed(&role, editable, began_on) {
             return UntargetedWeb::Refuse;
@@ -1784,8 +1785,8 @@ fn untargeted_web_target(pid: i32, readback: &TypingReadback, background: bool) 
 
 /// Whether untargeted background keys may go to the web element focused now
 /// (`role`, `editable`): `began_on` is `Some(still the same)` when the call
-/// began with a specific element focused, `None` when it began with the page
-/// itself or no readable focus.
+/// began with a specific page field focused, `None` when it began with the
+/// page itself or no readable page field.
 fn untargeted_web_keys_allowed(role: &str, editable: bool, began_on: Option<bool>) -> bool {
     match began_on {
         Some(same) => same && takes_text(role, editable),
