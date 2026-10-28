@@ -145,6 +145,17 @@ impl DoubleClickTool {
             if now.as_deref() != Some(asked.as_str()) {
                 return Err(renamed(idx, &asked, now));
             }
+            // The click compares the element with the snapshot's row: one the
+            // app reused for other content is not opened either.
+            let changed = selected
+                .structured_content
+                .as_ref()
+                .and_then(|structured| structured.get("code"))
+                .and_then(Value::as_str)
+                == Some("element_changed");
+            if changed {
+                return Err(NotFromBehind::Refuse(said));
+            }
             if selected.is_error == Some(true) {
                 return Err(NotFromBehind::AxOpen(format!(
                     "selecting the item from behind failed ({said})"
