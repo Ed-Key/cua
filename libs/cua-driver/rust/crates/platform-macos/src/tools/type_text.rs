@@ -1776,7 +1776,8 @@ enum Began {
 /// | a field in web content | complete | Yes | no | yes | unknown, not retryable | Shift+Return in AXTextArea, else character |
 /// | an Electron token proven before its focus click | fails later | Yes | no | yes | unknown | as above |
 /// | a native field | complete | No | yes | no | counted, retryable | character |
-/// | any | Incomplete (then recovers or not) | Unknown | no | yes | unknown | character; the result says the classification was uncertain |
+/// | any, in a Chromium-family app | Incomplete (then recovers or not) | Unknown | no | yes | unknown | character; the result says the classification was uncertain |
+/// | any, in another app | Incomplete | No | yes | no | counted | character (as before item 42) |
 ///
 /// Untargeted keys from behind, last check before the first key (rows of
 /// [`last_check`]; foreground skips the identity rows because fronting the
@@ -1804,10 +1805,13 @@ impl TypingDecision {
     /// `proven`: an earlier proof that the target is web content (the
     /// Electron token's, before its focus click). `role`: the target's role
     /// ("" when unreadable or no target).
-    fn settle(proven: bool, classification: WebAreaClassification, role: &str) -> Self {
+    /// `chromium`: the process is Chromium-family (Chrome, Electron), the
+    /// only one whose unreadable ancestry is taken as possibly web content;
+    /// elsewhere it stays native, as before item 42.
+    fn settle(proven: bool, classification: WebAreaClassification, role: &str, chromium: bool) -> Self {
         let web = if proven || classification == WebAreaClassification::WebContent {
             Web::Yes
-        } else if classification == WebAreaClassification::NonWebContent {
+        } else if classification == WebAreaClassification::NonWebContent || !chromium {
             Web::No
         } else {
             Web::Unknown
@@ -2328,7 +2332,12 @@ fn type_text_blocking(
         } else {
             WebAreaClassification::Incomplete
         };
-        TypingDecision::settle(proven_web_field, classification, &readback.role())
+        TypingDecision::settle(
+            proven_web_field,
+            classification,
+            &readback.role(),
+            crate::ax::enablement::chromium_family_cached(pid),
+        )
     };
     let addressed_web_field = element_ptr_and_idx.is_some() && decision.web_rules();
 
@@ -3145,23 +3154,24 @@ mod tests {
     fn the_web_decision_rows() {
         use crate::input::keyboard::LineBreaks;
         use WebAreaClassification::*;
-        let d = TypingDecision::settle(false, WebContent, "AXTextArea");
+        let d = TypingDecision::settle(false, WebContent, "AXTextArea", true);
         assert_eq!((d.web, d.began, d.line_breaks), (Web::Yes, Began::Field, LineBreaks::ShiftReturn));
         assert!(d.web_rules());
-        let d = TypingDecision::settle(false, WebContent, "AXTextField");
+        let d = TypingDecision::settle(false, WebContent, "AXTextField", true);
         assert_eq!(d.line_breaks, LineBreaks::Characters, "a single-line page field");
-        let d = TypingDecision::settle(true, Incomplete, "AXTextArea");
+        let d = TypingDecision::settle(true, Incomplete, "AXTextArea", true);
         assert_eq!((d.web, d.line_breaks), (Web::Yes, LineBreaks::ShiftReturn), "a proven Electron token");
-        let d = TypingDecision::settle(false, NonWebContent, "AXTextArea");
+        let d = TypingDecision::settle(false, NonWebContent, "AXTextArea", true);
         assert_eq!((d.web, d.line_breaks), (Web::No, LineBreaks::Characters));
         assert!(!d.web_rules(), "a native field keeps the AX write and its retryable count");
         for unknown in [Incomplete, WindowFocusUnavailable] {
-            let d = TypingDecision::settle(false, unknown, "AXTextArea");
+            let d = TypingDecision::settle(false, unknown, "AXTextArea", true);
             assert_eq!((d.web, d.line_breaks), (Web::Unknown, LineBreaks::Characters));
             assert!(d.web_rules(), "unknown takes the safe side: keys, no retryable count");
         }
-        assert_eq!(TypingDecision::settle(false, WebContent, "AXWebArea").began, Began::Page);
-        assert_eq!(TypingDecision::settle(false, Incomplete, "").began, Began::Unread);
+        assert_eq!(TypingDecision::settle(false, WebContent, "AXWebArea", true).began, Began::Page);
+        assert_eq!(TypingDecision::settle(false, Incomplete, "AXTextArea", false).web, Web::No, "another app's unreadable ancestry stays native");
+        assert_eq!(TypingDecision::settle(false, Incomplete, "", true).began, Began::Unread);
     }
 
     /// Item 42, second table of [`TypingDecision`]: the last check before
@@ -3170,10 +3180,10 @@ mod tests {
     fn the_last_check_rows() {
         use crate::input::keyboard::LineBreaks::*;
         use WebAreaClassification::*;
-        let field = TypingDecision::settle(false, WebContent, "AXTextArea");
-        let page = TypingDecision::settle(false, WebContent, "AXWebArea");
-        let unread = TypingDecision::settle(false, Incomplete, "");
-        let native = TypingDecision::settle(false, NonWebContent, "AXTextArea");
+        let field = TypingDecision::settle(false, WebContent, "AXTextArea", true);
+        let page = TypingDecision::settle(false, WebContent, "AXWebArea", true);
+        let unread = TypingDecision::settle(false, Incomplete, "", true);
+        let native = TypingDecision::settle(false, NonWebContent, "AXTextArea", true);
         let k = LastCheck::Keys;
         // began on a field
         assert_eq!(last_check(field, true, Some(true), "AXTextArea", false), k(ShiftReturn));
@@ -3957,7 +3967,7 @@ mod tests {
                 settle_ms,
                 std::time::Instant::now(),
                 true,
-                TypingDecision::settle(true, WebAreaClassification::WebContent, "AXTextArea"),
+                TypingDecision::settle(true, WebAreaClassification::WebContent, "AXTextArea", true),
             );
             let case = format!("{role} settle {settle_ms}");
             let error = result.err().unwrap_or_else(|| panic!("{case}: must refuse"));

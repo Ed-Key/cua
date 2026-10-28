@@ -203,7 +203,7 @@ fn wait_outcome(
 static CHROMIUM_FAMILY: LazyLock<Mutex<HashMap<i32, (ProcessStartStamp, bool)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn chromium_family_cached(pid: i32) -> bool {
+pub(crate) fn chromium_family_cached(pid: i32) -> bool {
     let Some(stamp) = process_start_stamp(pid) else {
         return false;
     };
