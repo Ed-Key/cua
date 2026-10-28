@@ -2363,7 +2363,8 @@ fn type_text_blocking(
             delivered_chars,
             unconfirmed,
             text.chars().count(),
-            web_target,
+            // A web proof made earlier or only now: either is enough.
+            web_target || target_in_web_area(pid, judged, window_id),
         );
         // Only claim the `_fg` path when a front actually happened; when no
         // foregrounding occurred (no window, or SPIs unavailable) these were
@@ -2684,7 +2685,8 @@ fn type_text_blocking(
         delivered_chars,
         unconfirmed,
         text.chars().count(),
-        web_target,
+        // A web proof made earlier or only now: either is enough.
+        web_target || target_in_web_area(pid, judged, window_id),
     );
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
