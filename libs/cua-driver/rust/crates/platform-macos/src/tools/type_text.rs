@@ -61,8 +61,9 @@ fn def() -> &'static ToolDef {
         description:
             "Insert text at an element (element_token) or the \
              focused element. A web page field works in the background by element_token or \
-             x,y: the field is focused and gets key events. For Electron fields pass x,y \
-             screenshot pixels: it clicks there for real focus, then types. No special keys (use \
+             x,y: the field is focused and gets key events, Electron's included. A line \
+             break into a multi-line page field is sent as Shift+Return (most editors take it \
+             as a line break; a page can bind it to send). No other special keys (use \
              press_key). If unverifiable, re-read before retrying to avoid duplicate text. \
              Details: skill://cua-driver/MACOS.md"
             .into(),
