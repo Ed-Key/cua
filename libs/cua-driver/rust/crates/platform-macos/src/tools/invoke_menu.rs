@@ -1453,6 +1453,10 @@ impl Tool for InvokeMenuTool {
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
             let hidden_before = app_hidden(pid) == Some(true);
 
+            // Read before the press: a command can retitle its item (New
+            // Folder with Selection), and the editor wait needs the answer.
+            let opens_editor = crate::tools::edit_commit::app_saves_on_end_editing(pid)
+                && item_opens_editor(pid, &path);
             let result = focus_exact_window(pid, window_id)
                 .and_then(|()| unsafe { invoke_path(pid, &path) });
 
@@ -1471,7 +1475,7 @@ impl Tool for InvokeMenuTool {
                 && result.is_ok()
                 && crate::tools::edit_commit::app_saves_on_end_editing(pid)
                 && {
-                    let expected = item_opens_editor(pid, &path);
+                    let expected = opens_editor;
                     let wait = if expected { EXPECTED_INLINE_EDIT_WAIT } else { INLINE_EDIT_WAIT };
                     crate::ax::bindings::await_inline_edit_after_menu(pid, window_id, wait, expected)
                 };
