@@ -82,10 +82,19 @@ fn token_refused(structured: Option<&Value>) -> bool {
 /// a longer name ("Report" is not "Reports"). No row known: nothing to
 /// compare against.
 fn row_names_exactly(row: Option<&str>, name: &str) -> bool {
+    // Each field follows a space and ends the line or precedes a space, so a
+    // field is matched whole: "(Q3)" inside the title "Draft (Q3)" is not
+    // followed by a space.
+    let whole = |row: &str, field: &str| {
+        let pattern = format!(" {field}");
+        row.match_indices(&pattern).any(|(at, _)| {
+            matches!(row[at + pattern.len()..].chars().next(), None | Some(' ' | '\u{1}'))
+        })
+    };
     row.is_none_or(|row| {
-        row.contains(&format!("\"{name}\""))
-            || row.contains(&serde_json::json!(name).to_string())
-            || row.contains(&format!("({name})"))
+        whole(row, &format!("\"{name}\""))
+            || whole(row, &format!("= {}", serde_json::json!(name)))
+            || whole(row, &format!("({name})"))
     })
 }
 
@@ -137,7 +146,11 @@ impl DoubleClickTool {
         .await
         .ok()
         .flatten()
-        .ok_or_else(|| NotFromBehind::AxOpen("the item's name could not be read".into()))?;
+        .ok_or_else(|| {
+            NotFromBehind::Refuse(format!(
+                "element [{idx}]'s name could not be read, so it could not be proven to be the item the snapshot showed. Nothing was sent. Take a fresh snapshot"
+            ))
+        })?;
         // The name the snapshot showed for this element: a list that refreshed
         // after the snapshot can have handed the element to another item.
         if !row_names_exactly(snapshot_row.as_deref(), &asked) {
@@ -370,12 +383,16 @@ impl Tool for DoubleClickTool {
             // AXPress: AXOpen on an Open/Save panel row activates the panel's
             // app (measured, and it fails there with -25205).
             let foreground = delivery_mode.is_foreground();
+            // The worker holds the lease too: a cancelled call must not free
+            // Finder for other input while the AXOpen still runs.
+            let worker_lease = _mutation_lease.clone();
             let result = crate::focus_guard::with_focus_suppressed(
                 (!foreground).then_some(pid),
                 crate::apps::frontmost_pid(),
                 "double_click.AXOpen",
                 || {
                     tokio::task::spawn_blocking(move || {
+                        let _lease = worker_lease;
                         ax_double_click(
                             pid,
                             wid,
@@ -667,6 +684,11 @@ mod tests {
         assert!(row_names_exactly(Some(field), "Report \"Q3\".txt"));
         assert!(!row_names_exactly(Some(field), "Q3"));
         assert!(row_names_exactly(None, "anything"));
+        let titled = "- [51] AXImage \"Draft (Q3)\" [actions=[open]]\u{1}None";
+        assert!(row_names_exactly(Some(titled), "Draft (Q3)"));
+        assert!(!row_names_exactly(Some(titled), "Q3"));
+        let described = "- [9] AXImage (Q3)\u{1}None";
+        assert!(row_names_exactly(Some(described), "Q3"));
     }
 
     #[test]
