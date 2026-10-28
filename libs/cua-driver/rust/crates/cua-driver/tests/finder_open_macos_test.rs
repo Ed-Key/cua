@@ -143,9 +143,30 @@ fn double_click_on_a_finder_folder_behind_another_app_opens_it_from_behind() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
+    // The front app, sampled through the whole call (the select as well as
+    // the open): Finder must never be in front, not even briefly.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                seen.insert(front_app_name());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            seen
+        })
+    };
     let result = driver.call(
         "double_click",
         serde_json::json!({"pid": pid, "window_id": window_id, "element_token": token}),
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let fronts = sampler.join().expect("front sampler");
+    assert_eq!(
+        fronts.into_iter().collect::<Vec<_>>(),
+        vec!["Calculator".to_owned()],
+        "another app was in front during the double_click"
     );
     assert!(!result.is_error(), "opening a Finder folder from behind failed: {}", result.text());
     assert!(

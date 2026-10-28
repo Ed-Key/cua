@@ -115,6 +115,20 @@ impl DoubleClickTool {
         .ok()
         .flatten()
         .ok_or_else(|| NotFromBehind::AxOpen("the item's name could not be read".into()))?;
+        // The name the snapshot showed for this element: a list that refreshed
+        // after the snapshot can have handed the element to another item.
+        let snapshot_row = self
+            .state
+            .snapshots
+            .with_latest_payload(pid, u64::from(wid), |payload| {
+                payload.rows.indexed.get(&idx).map(|(_, signature)| signature.clone())
+            })
+            .flatten();
+        if !super::click::still_names_row(snapshot_row.as_deref(), &asked) {
+            return Err(NotFromBehind::Refuse(format!(
+                "element [{idx}] now names {asked:?}, not what the snapshot showed; the app reused it for other content. Nothing was sent. Take a fresh snapshot"
+            )));
+        }
         // Whether the element still names the asked item and is Finder's only
         // selection: Cmd+O then opens exactly it. A list that refreshed can
         // hand the element to another item.
