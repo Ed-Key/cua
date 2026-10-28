@@ -77,24 +77,44 @@ fn token_refused(structured: Option<&Value>) -> bool {
     })
 }
 
-/// Whether a snapshot row (its rendered line, see ax::tree::format_node_line)
-/// shows exactly `name` as its title, value or description, not as a part of
-/// a longer name ("Report" is not "Reports"). No row known: nothing to
-/// compare against.
-fn row_names_exactly(row: Option<&str>, name: &str) -> bool {
-    // Each field follows a space and ends the line or precedes a space, so a
-    // field is matched whole: "(Q3)" inside the title "Draft (Q3)" is not
-    // followed by a space.
-    let whole = |row: &str, field: &str| {
-        let pattern = format!(" {field}");
-        row.match_indices(&pattern).any(|(at, _)| {
-            matches!(row[at + pattern.len()..].chars().next(), None | Some(' ' | '\u{1}'))
-        })
+/// The title and value a snapshot row shows (its rendered line, see
+/// ax::tree::format_node_line: `- [idx] ROLE "title" = "value" ...`).
+// ponytail: a title that itself holds `" [`, `" (` or `" = ` is cut there
+// and then matches nothing, which refuses (the safe side).
+fn row_title_and_value(row: &str) -> (Option<String>, Option<String>) {
+    let line = row.split('\u{1}').next().unwrap_or_default();
+    let Some(rest) = line.strip_prefix("- ") else {
+        return (None, None);
     };
+    let rest = match rest.strip_prefix('[') {
+        Some(indexed) => indexed.split_once("] ").map_or("", |(_, rest)| rest),
+        None => rest,
+    };
+    // The role is one word.
+    let mut rest = rest.split_once(' ').map_or("", |(_, rest)| rest);
+    let mut title = None;
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let end = quoted.match_indices('"').map(|(at, _)| at).find(|&at| {
+            let after = &quoted[at + 1..];
+            after.is_empty() || [" = ", " [", " ("].iter().any(|next| after.starts_with(next))
+        });
+        if let Some(end) = end {
+            title = Some(quoted[..end].to_owned());
+            rest = &quoted[end + 1..];
+        }
+    }
+    let value = rest.strip_prefix(" = ").and_then(|json| {
+        serde_json::Deserializer::from_str(json).into_iter::<String>().next()?.ok()
+    });
+    (title, value)
+}
+
+/// Whether the snapshot row shows exactly `name` as its title or value. No
+/// row known: nothing to compare against.
+fn row_names_exactly(row: Option<&str>, name: &str) -> bool {
     row.is_none_or(|row| {
-        whole(row, &format!("\"{name}\""))
-            || whole(row, &format!("= {}", serde_json::json!(name)))
-            || whole(row, &format!("({name})"))
+        let (title, value) = row_title_and_value(row);
+        title.as_deref() == Some(name) || value.as_deref() == Some(name)
     })
 }
 
@@ -677,18 +697,18 @@ mod tests {
 
     #[test]
     fn the_snapshot_row_must_show_the_whole_name() {
-        let icon = "- [51] AXImage \"Reports\" [actions=[open,show_menu]]";
-        let field = "- [74] AXTextField = \"Report \\\"Q3\\\".txt\" [actions=[open]]";
-        assert!(row_names_exactly(Some(icon), "Reports"));
-        assert!(!row_names_exactly(Some(icon), "Report"));
+        let icon = "- [50] AXImage \"Draft (Q3) Copy\" (Draft (Q3) Copy) [id=Draft (Q3) Copy actions=[open,show_menu]]\u{1}None";
+        assert!(row_names_exactly(Some(icon), "Draft (Q3) Copy"));
+        for part in ["Q3", "Draft", "Copy", "Draft (Q3)"] {
+            assert!(!row_names_exactly(Some(icon), part), "{part} matched");
+        }
+        let field = "- [74] AXTextField = \"Report \\\"Q3\\\".txt\" [actions=[open,show_menu,confirm]]";
         assert!(row_names_exactly(Some(field), "Report \"Q3\".txt"));
         assert!(!row_names_exactly(Some(field), "Q3"));
+        let both = "- [9] AXTextField \"\" = \"note.txt\" [actions=[open]]";
+        assert!(row_names_exactly(Some(both), "note.txt"));
+        assert!(!row_names_exactly(Some("- [3] AXCell [actions=[open]]"), "note.txt"));
         assert!(row_names_exactly(None, "anything"));
-        let titled = "- [51] AXImage \"Draft (Q3)\" [actions=[open]]\u{1}None";
-        assert!(row_names_exactly(Some(titled), "Draft (Q3)"));
-        assert!(!row_names_exactly(Some(titled), "Q3"));
-        let described = "- [9] AXImage (Q3)\u{1}None";
-        assert!(row_names_exactly(Some(described), "Q3"));
     }
 
     #[test]
