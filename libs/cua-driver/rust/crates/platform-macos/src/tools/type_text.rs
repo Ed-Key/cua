@@ -1778,7 +1778,7 @@ fn untargeted_web_target(pid: i32, readback: &TypingReadback, background: bool) 
         if background && !untargeted_web_keys_allowed(&role, editable, began_on) {
             return UntargetedWeb::Refuse;
         }
-        UntargetedWeb::Keys(line_breaks_for(class, &role))
+        UntargetedWeb::Keys(line_breaks_for(true, &role))
     }
 }
 
@@ -1807,8 +1807,8 @@ fn takes_text(role: &str, editable_ancestor: bool) -> bool {
 /// character event inserts nothing (item 42); a character elsewhere. A
 /// single-line page field keeps the character: Shift+Return there submits
 /// its form.
-fn line_breaks_for(classification: WebAreaClassification, role: &str) -> crate::input::keyboard::LineBreaks {
-    if classification == WebAreaClassification::WebContent && role == "AXTextArea" {
+fn line_breaks_for(web: bool, role: &str) -> crate::input::keyboard::LineBreaks {
+    if web && role == "AXTextArea" {
         crate::input::keyboard::LineBreaks::ShiftReturn
     } else {
         crate::input::keyboard::LineBreaks::Characters
@@ -2210,13 +2210,19 @@ fn type_text_blocking(
     // An addressed field in web content: its keys are guarded by a focus
     // proof on either route. A token-addressed Electron field reaches here
     // only after its pixel focus was proven (item 42).
-    let addressed_web_field = element_ptr_and_idx.is_some()
-        && (proven_web_field || target_in_web_area(pid, element_ptr_and_idx, window_id));
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
-    let line_breaks = line_breaks_for(
-        classify_target_web_area(pid, element_ptr_and_idx, window_id),
-        &readback.role(),
-    );
+    // Web content, decided once for the whole call: an earlier proof (the
+    // token's, before its focus click, or the read-back's at capture) holds
+    // even if a later ancestry read fails, so a page field never falls back
+    // to the AX write, character line breaks or a retryable partial count.
+    // Proven web content picks the line-break mode; the untrusted reading
+    // (an unavailable window focus counts as web) keeps every other rule.
+    let web_proven = proven_web_field
+        || (element_ptr_and_idx.is_none() && readback.began_on_page_field)
+        || classify_target_web_area(pid, element_ptr_and_idx, window_id) == WebAreaClassification::WebContent;
+    let web_target = web_proven || target_in_web_area(pid, element_ptr_and_idx, window_id);
+    let addressed_web_field = element_ptr_and_idx.is_some() && web_target;
+    let line_breaks = line_breaks_for(web_proven, &readback.role());
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -2348,7 +2354,7 @@ fn type_text_blocking(
             delivered_chars,
             unconfirmed,
             text.chars().count(),
-            target_in_web_area(pid, element_ptr_and_idx, window_id),
+            web_target,
         );
         // Only claim the `_fg` path when a front actually happened; when no
         // foregrounding occurred (no window, or SPIs unavailable) these were
@@ -2445,8 +2451,7 @@ fn type_text_blocking(
     // write into its contenteditable or textarea and inserts nothing (item 42).
     let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let web_page = (proven_web_field && !owns)
-            || target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let web_page = web_target || target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
         let keep = ax_text_write_first(&role, owns, web_page);
         if !keep && owns {
             unsafe { CFRelease(element as CFTypeRef) };
@@ -2491,7 +2496,7 @@ fn type_text_blocking(
                 role.as_str(),
                 "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
             )
-            && !target_in_web_area(pid, element_ptr_and_idx, window_id)
+            && !web_target
             && !crate::input::ax_actions::is_element_focused(pid, element as usize)
         {
             let prepare_element = || crate::input::ax_actions::focus_element(element as usize);
@@ -2670,7 +2675,7 @@ fn type_text_blocking(
         delivered_chars,
         unconfirmed,
         text.chars().count(),
-        target_in_web_area(pid, element_ptr_and_idx, window_id),
+        web_target,
     );
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
@@ -3041,17 +3046,11 @@ mod tests {
     #[test]
     fn web_content_line_breaks_are_shift_return() {
         use crate::input::keyboard::LineBreaks;
-        assert_eq!(line_breaks_for(WebAreaClassification::WebContent, "AXTextArea"), LineBreaks::ShiftReturn);
+        assert_eq!(line_breaks_for(true, "AXTextArea"), LineBreaks::ShiftReturn);
         for role in ["AXTextField", "AXSearchField", "AXComboBox", "AXWebArea", ""] {
-            assert_eq!(line_breaks_for(WebAreaClassification::WebContent, role), LineBreaks::Characters, "{role}");
+            assert_eq!(line_breaks_for(true, role), LineBreaks::Characters, "{role}");
         }
-        for other in [
-            WebAreaClassification::NonWebContent,
-            WebAreaClassification::Incomplete,
-            WebAreaClassification::WindowFocusUnavailable,
-        ] {
-            assert_eq!(line_breaks_for(other, "AXTextArea"), LineBreaks::Characters);
-        }
+        assert_eq!(line_breaks_for(false, "AXTextArea"), LineBreaks::Characters);
     }
 
     #[test]
