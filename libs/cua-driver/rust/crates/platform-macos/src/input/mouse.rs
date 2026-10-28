@@ -557,6 +557,11 @@ impl TurnLock {
         }
     }
 
+    /// Whether this thread already holds the turn (a nested admission).
+    fn held_here(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).holder == Some(std::thread::current().id())
+    }
+
     /// Hold the turn, waiting up to `wait` while another thread holds it.
     fn take(&self, wait: std::time::Duration) -> Option<Turn<'_>> {
         let me = std::thread::current().id();
@@ -601,11 +606,24 @@ pub enum ForegroundBusy {
     EarlierAction { waited: std::time::Duration },
     /// A HID click cua posted earlier was still held by an event tap.
     ClickHeld { tap_owner: Option<i32>, waited: std::time::Duration },
+    /// The user typed within the quiet period and kept typing through the
+    /// wait (see `super::user_activity`).
+    UserActive { typed_ago: std::time::Duration, waited: std::time::Duration },
 }
 
 impl std::fmt::Display for ForegroundBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
+            Self::UserActive { typed_ago, waited } => write!(
+                f,
+                "user_active: the user typed {:.1} s ago and was still typing after {} ms of waiting; \
+                 bringing a window forward now would take their keystrokes, so nothing was activated \
+                 or sent. Use the background route instead (the same call without \
+                 delivery_mode:\"foreground\", by element_token or x,y), or retry once the user has \
+                 stopped typing",
+                typed_ago.as_secs_f64(),
+                waited.as_millis()
+            ),
             Self::EarlierAction { waited } => write!(
                 f,
                 "an earlier foreground action (possibly of a cancelled call) was still running after {} ms, \
@@ -644,7 +662,23 @@ const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// release would land on what comes forward, until it passes or counts as
 /// dropped. Refused: nothing may be activated or sent. Within a turn that
 /// already passed this wait (a gesture wrapping its click), it is not repeated.
+///
+/// A first admission also waits while the user is typing, and refuses if
+/// they keep on (`super::user_activity`): the front change would take their
+/// keys.
 pub fn foreground_turn() -> Result<ForegroundTurn, ForegroundBusy> {
+    let nested = FOREGROUND.held_here();
+    let turn = admit(&FOREGROUND, TURN_WAIT, click_in_flight, UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2)?;
+    if !nested {
+        super::user_activity::wait_until_user_idle()?;
+    }
+    Ok(turn)
+}
+
+/// [`foreground_turn`] without the user-typing wait, for the background
+/// keyboard route's own focus preparation: its keys are addressed to the
+/// target process and never take the user's.
+pub(crate) fn background_focus_turn() -> Result<ForegroundTurn, ForegroundBusy> {
     admit(&FOREGROUND, TURN_WAIT, click_in_flight, UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2)
 }
 

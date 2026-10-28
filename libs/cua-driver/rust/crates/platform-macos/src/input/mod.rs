@@ -17,6 +17,7 @@ pub mod mouse;
 pub(crate) mod native_focus_events;
 pub mod pointer_toolkit;
 pub mod skylight;
+pub(crate) mod user_activity;
 
 pub use interactive::{
     GesturePhase, InteractiveDeliveryMode, InteractiveInputBatch, InteractiveInputConfig,
