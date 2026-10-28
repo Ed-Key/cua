@@ -1291,6 +1291,9 @@ pub(crate) async fn press_from_behind_only(
     pid: i32,
     window_id: u32,
     path: Vec<String>,
+    // Run once the foreground turn is held, before anything is sent; `Err`
+    // stops the press with that reason.
+    ready: impl FnOnce() -> Result<(), String> + Send + 'static,
 ) -> Result<String, String> {
     let mutation = if crate::background_mutation::held_by_current_task(pid) {
         None
@@ -1305,6 +1308,7 @@ pub(crate) async fn press_from_behind_only(
         let prior = crate::apps::frontmost_pid()
             .filter(|prior| *prior != pid)
             .ok_or_else(|| "the app is in front (or no other app is)".to_owned())?;
+        ready()?;
         let restore = || {
             crate::apps::confirm_front(prior)
                 || (crate::apps::restore_prior_app(prior) && crate::apps::confirm_front(prior))

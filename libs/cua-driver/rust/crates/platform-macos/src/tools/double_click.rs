@@ -57,6 +57,16 @@ fn item_name(element: AXUIElementRef) -> Option<String> {
         .find(|name| !name.trim().is_empty())
 }
 
+const NOT_ALONE: &str = "the item could not be read back as Finder's only selection after the click, so File > Open could open something else";
+
+/// The refusal for an element that names another item than it did.
+fn renamed(idx: usize, asked: &str, now: Option<String>) -> NotFromBehind {
+    NotFromBehind::Refuse(format!(
+        "element [{idx}] named {asked:?} before the click and {} after it, so it was not opened; take a fresh snapshot",
+        now.map_or_else(|| "nothing readable".to_owned(), |now| format!("{now:?}"))
+    ))
+}
+
 /// Why the open from behind did not run.
 enum NotFromBehind {
     /// Nothing was opened: AXOpen runs, and the result says why.
@@ -105,6 +115,17 @@ impl DoubleClickTool {
         .ok()
         .flatten()
         .ok_or_else(|| NotFromBehind::AxOpen("the item's name could not be read".into()))?;
+        // Whether the element still names the asked item and is Finder's only
+        // selection: Cmd+O then opens exactly it. A list that refreshed can
+        // hand the element to another item.
+        let state = move |element: &crate::ax::snapshot::RetainedElement| {
+            let ptr = element.as_ptr();
+            let named = item_name(ptr as AXUIElementRef);
+            let alone = crate::input::ax_actions::RowSelection::capture(ptr)
+                .and_then(|row| row.observe())
+                .is_some_and(|readback| readback.exclusive());
+            (named, alone)
+        };
         crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async move {
             let selected = click.invoke(click_args).await;
             let said = selected
@@ -115,44 +136,55 @@ impl DoubleClickTool {
                     _ => None,
                 })
                 .unwrap_or_default();
+            // Every way out reads the element again: one that now names
+            // another item is neither opened by Cmd+O nor by AXOpen.
+            let read_guard = element_guard.clone();
+            let (now, alone) = crate::background_mutation::spawn_blocking(move || state(&read_guard))
+                .await
+                .unwrap_or((None, false));
+            if now.as_deref() != Some(asked.as_str()) {
+                return Err(renamed(idx, &asked, now));
+            }
             if selected.is_error == Some(true) {
                 return Err(NotFromBehind::AxOpen(format!(
                     "selecting the item from behind failed ({said})"
                 )));
             }
-            // The item named as asked, and Finder's only selection: Cmd+O opens
-            // exactly it. A list that refreshed can hand the element to
-            // another item; then nothing is opened.
-            let (now, alone) = crate::background_mutation::spawn_blocking(move || {
-                let ptr = element_guard.as_ptr();
-                (
-                    item_name(ptr as AXUIElementRef),
-                    crate::input::ax_actions::RowSelection::capture(ptr)
-                        .and_then(|row| row.observe())
-                        .is_some_and(|readback| readback.exclusive()),
-                )
-            })
-            .await
-            .unwrap_or((None, false));
-            if now.as_deref() != Some(asked.as_str()) {
-                return Err(NotFromBehind::Refuse(format!(
-                    "element [{idx}] named {asked:?} before the click and {} after it, so it was not opened; take a fresh snapshot",
-                    now.map_or_else(|| "nothing readable".to_owned(), |now| format!("{now:?}"))
-                )));
-            }
             if !alone {
-                return Err(NotFromBehind::AxOpen(
-                    "the item could not be read back as Finder's only selection after the click, so File > Open could open something else"
-                        .into(),
-                ));
+                return Err(NotFromBehind::AxOpen(NOT_ALONE.into()));
             }
+            // Read again once the foreground turn is held, right before the
+            // press: a foreground click (which takes no per-process lease) can
+            // change Finder's selection in between.
             let path = FINDER_OPEN.iter().map(|segment| (*segment).to_owned()).collect();
-            let opened = super::invoke_menu::press_from_behind_only(pid, wid, path)
-                .await
-                .map_err(NotFromBehind::AxOpen)?;
-            Ok(format!(
-                "Opened element [{idx}] from behind: selected it (the only selection), then ran Finder's File > Open from behind instead of AXOpen, which raises Finder's window. {opened}"
-            ))
+            let check_guard = element_guard.clone();
+            let check_asked = asked.clone();
+            let opened = super::invoke_menu::press_from_behind_only(pid, wid, path, move || {
+                match state(&check_guard) {
+                    (Some(named), true) if named == check_asked => Ok(()),
+                    (Some(named), _) if named != check_asked => {
+                        Err(format!("the element names {named:?} now"))
+                    }
+                    _ => Err(NOT_ALONE.into()),
+                }
+            })
+            .await;
+            match opened {
+                Ok(opened) => Ok(format!(
+                    "Opened element [{idx}] from behind: selected it (the only selection), then ran Finder's File > Open from behind instead of AXOpen, which raises Finder's window. {opened}"
+                )),
+                Err(why) => {
+                    let read_guard = element_guard.clone();
+                    let now = crate::background_mutation::spawn_blocking(move || state(&read_guard).0)
+                        .await
+                        .unwrap_or(None);
+                    if now.as_deref() != Some(asked.as_str()) {
+                        Err(renamed(idx, &asked, now))
+                    } else {
+                        Err(NotFromBehind::AxOpen(why))
+                    }
+                }
+            }
         })
         .await
     }
