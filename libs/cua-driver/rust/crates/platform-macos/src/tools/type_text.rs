@@ -2688,6 +2688,19 @@ fn focused_web_field(pid: i32, window_id: u32) -> FocusedWebField {
         let electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
         let outcome = if role == "AXWebArea" && !electron {
             FocusedWebField::PageOnly
+        } else if electron
+            && role != "AXWebArea"
+            && target_in_web_area(pid, Some((focused as usize, None)), Some(window_id))
+            && !takes_text(&role, {
+                let editable = crate::ax::bindings::copy_element_attr(focused, "AXEditableAncestor");
+                editable.map(|e| CFRelease(e as CFTypeRef)).is_some()
+            })
+        {
+            // A focused Electron page control (a select-only combo box, a
+            // button) takes keys as its own commands: Chromium ignored the AX
+            // text write these used to get, keys would act (item 42). The
+            // page itself keeps today's keys, which reach its focused field.
+            FocusedWebField::PageOnly
         } else if !is_text_entry_role(&role)
             && !electron
             && target_in_web_area(pid, Some((focused as usize, None)), Some(window_id))
