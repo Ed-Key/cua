@@ -75,7 +75,7 @@ fn select_alone_by_ax(element_ptr: usize) -> bool {
     let Some(row) = crate::input::ax_actions::RowSelection::capture(element_ptr) else {
         return false;
     };
-    let alone = || row.observe().is_some_and(|readback| readback.exclusive());
+    let alone = || only_selection(element_ptr);
     if alone() {
         return true;
     }
@@ -135,6 +135,56 @@ unsafe fn select_through_selected_children(element: AXUIElementRef, proven: &dyn
         core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
     }
     selected
+}
+
+/// Whether the item is the only selection of the list that owns Finder's
+/// selection: the nearest ancestor (up to 5) that reports AXSelectedChildren
+/// must hold exactly one element, the item or one of its ancestors below
+/// that list (icon view selects the icon's cell). A RowSelection read-back
+/// alone scans only the icon's own cell there, which cannot see another
+/// selected icon. With no such ancestor, the RowSelection read-back decides
+/// (list view's AXSelectedRows). `false` when unreadable.
+fn only_selection(element_ptr: usize) -> bool {
+    use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
+    unsafe {
+        let element = element_ptr as AXUIElementRef;
+        let mut path = vec![element];
+        let mut owned = Vec::new();
+        let mut verdict = None;
+        let mut current = element;
+        for _ in 0..5 {
+            let Some(parent) = crate::ax::bindings::copy_element_attr(current, "AXParent") else {
+                break;
+            };
+            owned.push(parent);
+            match crate::ax::bindings::copy_element_array_attr_checked(parent, "AXSelectedChildren", 20_000) {
+                Ok(selected) => {
+                    let one = selected.len() == 1
+                        && path.iter().any(|on_path| CFEqual(selected[0] as CFTypeRef, *on_path as CFTypeRef) != 0);
+                    for child in selected {
+                        CFRelease(child as CFTypeRef);
+                    }
+                    verdict = Some(one);
+                    break;
+                }
+                Err(crate::ax::bindings::kAXErrorAttributeUnsupported | crate::ax::bindings::kAXErrorNoValue) => {}
+                Err(_) => {
+                    verdict = Some(false);
+                    break;
+                }
+            }
+            path.push(parent);
+            current = parent;
+        }
+        for parent in owned {
+            CFRelease(parent as CFTypeRef);
+        }
+        verdict.unwrap_or_else(|| {
+            crate::input::ax_actions::RowSelection::capture(element_ptr)
+                .and_then(|row| row.observe())
+                .is_some_and(|readback| readback.exclusive())
+        })
+    }
 }
 
 /// The refusal for an element that names another item than it did.
@@ -289,11 +339,23 @@ impl DoubleClickTool {
         let state = move |element: &crate::ax::snapshot::RetainedElement| {
             let ptr = element.as_ptr();
             let named = item_name(ptr as AXUIElementRef);
-            let alone = crate::input::ax_actions::RowSelection::capture(ptr)
-                .and_then(|row| row.observe())
-                .is_some_and(|readback| readback.exclusive());
-            (named, alone)
+            (named, only_selection(ptr))
         };
+        // The token must still name the latest snapshot's element: a newer
+        // snapshot (another read while this call waited) makes it stale,
+        // which the click tool would refuse; the AX select must too.
+        if let Err(refused) = self.state.snapshots.resolve(pid, args) {
+            return Err(NotFromBehind::Refuse(
+                refused
+                    .content
+                    .iter()
+                    .find_map(|content| match content {
+                        cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "the element token no longer resolves".into()),
+            ));
+        }
         crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async move {
             let select_guard = element_guard.clone();
             let by_ax = crate::background_mutation::spawn_blocking(move || {
