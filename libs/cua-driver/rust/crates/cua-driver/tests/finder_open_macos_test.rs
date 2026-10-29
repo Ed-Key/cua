@@ -219,12 +219,13 @@ fn double_click_behind_another_app_opens_only_the_item_when_two_are_selected() {
         assert!(Instant::now() < deadline, "Calculator did not come to the front");
         std::thread::sleep(Duration::from_millis(200));
     }
-    // Both icons selected, as Finder reports it (the hotkey's Outcome line
-    // reads the icon view's selection): otherwise this would test an open
-    // from an empty selection.
+    // Both icons selected, as Finder reports it (the Outcome line reads the
+    // icon view's selection): otherwise this would test an open from an
+    // empty selection. Edit > Select All from behind, as invoke_menu sends
+    // it: a background hotkey refuses while Finder has other windows open.
     let mut selected_both = false;
     for _ in 0..3 {
-        let all = driver.call("hotkey", serde_json::json!({"pid": pid, "window_id": window_id, "keys": ["cmd", "a"]}));
+        let all = driver.call("invoke_menu", serde_json::json!({"pid": pid, "window_id": window_id, "path": ["Edit", "Select All"]}));
         assert!(!all.is_error(), "select all failed: {}", all.text());
         let text = all.text();
         if let Some(line) = text.lines().find(|line| line.contains("selected in icon view")) {
