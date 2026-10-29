@@ -126,6 +126,56 @@ fn post_until<T>(
     Ok(posted)
 }
 
+/// How typed text's line breaks are sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineBreaks {
+    /// As characters, like every other character (native text views insert
+    /// them).
+    Characters,
+    /// As Shift+Return. A web page ignores a key event whose only content is
+    /// "\n" (Chromium reads it as an Unidentified key and inserts nothing,
+    /// item 42); Shift+Return is a line break in a textarea and in chat
+    /// composers where Return sends (Slack, Discord).
+    ShiftReturn,
+}
+
+/// One posted item of typed text and how many source characters it stands
+/// for ("\r\n" is one line break for two characters, so a stop at the
+/// deadline never splits it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyItem {
+    Char(char),
+    ShiftReturn { chars: usize },
+}
+
+impl KeyItem {
+    fn chars(self) -> usize {
+        match self {
+            KeyItem::Char(_) => 1,
+            KeyItem::ShiftReturn { chars } => chars,
+        }
+    }
+}
+
+/// The items `text` is posted as.
+fn key_items(text: &str, line_breaks: LineBreaks) -> Vec<KeyItem> {
+    let mut items: Vec<KeyItem> = Vec::new();
+    let mut previous = None;
+    for ch in text.chars() {
+        match (line_breaks, ch) {
+            (LineBreaks::ShiftReturn, '\n') if previous == Some('\r') => {
+                if let Some(KeyItem::ShiftReturn { chars }) = items.last_mut() {
+                    *chars += 1;
+                }
+            }
+            (LineBreaks::ShiftReturn, '\n' | '\r') => items.push(KeyItem::ShiftReturn { chars: 1 }),
+            _ => items.push(KeyItem::Char(ch)),
+        }
+        previous = Some(ch);
+    }
+    items
+}
+
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
 /// pause after each character (on top of the internal down/up key gap).
 /// Stops before the first character that would start at or after `deadline`;
@@ -135,11 +185,21 @@ pub fn type_text_with_delay(
     text: &str,
     inter_char_delay_ms: u64,
     deadline: Option<std::time::Instant>,
+    line_breaks: LineBreaks,
 ) -> anyhow::Result<usize> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
-    post_until(text.chars(), deadline, |ch| {
+    let items = key_items(text, line_breaks);
+    let posted_items = post_until(items.iter().copied(), deadline, |item| {
+        let ch = match item {
+            KeyItem::ShiftReturn { .. } => {
+                press_key(pid, "return", &["shift"])?;
+                pause_after_char(inter_char_delay_ms);
+                return Ok(());
+            }
+            KeyItem::Char(ch) => ch,
+        };
         let ch_str = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -153,15 +213,19 @@ pub fn type_text_with_delay(
         up.set_string(&ch_str);
         up.set_flags(CGEventFlags::CGEventFlagNull);
         post_keyboard_event(pid, &up);
-
-        // Additional inter-character delay on top of the internal key gap.
-        if inter_char_delay_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
-        } else {
-            key_gap_sleep();
-        }
+        pause_after_char(inter_char_delay_ms);
         Ok(())
-    })
+    })?;
+    Ok(items[..posted_items].iter().map(|item| item.chars()).sum())
+}
+
+/// Additional inter-character delay on top of the internal key gap.
+fn pause_after_char(inter_char_delay_ms: u64) {
+    if inter_char_delay_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
+    } else {
+        key_gap_sleep();
+    }
 }
 
 /// Send a key combination (hotkey) to `pid`.
@@ -1408,6 +1472,23 @@ mod tests {
     fn physical_text_rejects_characters_without_a_lossless_keycode() {
         let error = physical_text_events('🙂').unwrap_err().to_string();
         assert!(error.contains("U+1F642"), "{error}");
+    }
+
+    /// Item 42: on web content a line break is Shift+Return ("\r\n" once),
+    /// and every source character is still one posted item.
+    #[test]
+    fn web_line_breaks_are_shift_return_one_item_per_character() {
+        use KeyItem::*;
+        let items = key_items("A\nB\r\nC\r\n\n", LineBreaks::ShiftReturn);
+        assert_eq!(
+            items,
+            vec![Char('A'), ShiftReturn { chars: 1 }, Char('B'), ShiftReturn { chars: 2 }, Char('C'), ShiftReturn { chars: 2 }, ShiftReturn { chars: 1 }]
+        );
+        assert_eq!(items.iter().map(|i| i.chars()).sum::<usize>(), "A\nB\r\nC\r\n\n".chars().count());
+        assert_eq!(
+            key_items("A\nB", LineBreaks::Characters),
+            vec![Char('A'), Char('\n'), Char('B')]
+        );
     }
 
     #[test]

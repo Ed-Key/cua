@@ -467,14 +467,21 @@ search field is refused (`catalyst_text_needs_typing`); see WORKFLOW.md
 "Find content". On another Catalyst text field it writes the value and reads
 it back, without claiming the app reacted.
 
-Electron fix, in **one call**: `type_text({pid, window_id, x, y, text})`. Passing
-`x,y` (no `element_token`) is the **element px action** form of
-`type_text`: the tool pixel-clicks at `(x,y)` to give the Chromium /
-UIKit renderer the real keyboard focus the AX layer can't, then types
-into the now-focused field. Read `x,y` straight off the screenshot in
-the `get_window_state` response (same convention as `click`). This is
-the one-call replacement for the old two-step "pixel-click then
-`type_text`". Prefer this direct route. If an application only accepts paste,
+Electron, from behind: `type_text` by `element_token` on a page field (or by
+`x,y` on it) focuses the field with a background click at its centre, proves
+the page moved focus there, and types with keys; Chromium ignores the AX text
+write, so Electron page fields never get it. An untargeted `type_text` goes to
+the field the page has focused, and is refused when a control (a button, a
+select-only dropdown) holds focus instead. A line break in the text is sent as
+Shift+Return into a multi-line page field (a textarea or a chat composer such
+as Slack's, where Return sends); that is a line break in most editors, but a
+page can still bind Shift+Return to send, so check the draft before sending. A
+single-line page field gets no line break. When the window is fully covered,
+reads first ask the page to publish its current state, so the read after an
+action shows its effect. A window that has been fully covered since it opened
+has no page to read or type into until it has been shown once.
+
+Prefer this direct route. If an application only accepts paste,
 call `clipboard_write`, then `clipboard_read` and verify the returned types
 (and text when applicable) **before** selecting or replacing existing editor
 content. Send Cmd+V only after that read-back succeeds.

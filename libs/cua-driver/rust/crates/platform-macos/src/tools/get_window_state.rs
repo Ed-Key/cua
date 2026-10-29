@@ -2589,13 +2589,14 @@ fn unexposed_web_content(pid: i32, walk: &crate::ax::tree::TreeWalkResult) -> Op
     }
     Some(serde_json::json!({
         "exposed": false,
-        "reason": "No page content was found in this browser window, and the browser did not \
-            expose page content when the driver enabled accessibility for it. If this window \
-            should show a page, the browser may be withholding it from accessibility; this has \
-            been seen when the window was fully covered at that moment.",
-        "next": "Use the browser_* tools for page content, or bring_to_front this window and \
-            read it again (in testing, the page then appeared and stayed exposed after the \
-            window was covered again)."
+        "reason": "No page content was found in this window, and the app did not expose it \
+            when the driver enabled accessibility. A Chromium or Electron app builds a page's \
+            accessibility only after the page has been on screen: if this window has been \
+            fully covered since it opened, nothing in its page can be read or typed into from \
+            behind (input sent there reaches no field).",
+        "next": "Chrome pages: use the browser_* tools. Otherwise the window has to be shown \
+            once (any part of it uncovered, or bring_to_front); after that its page stays \
+            readable and usable from behind even when it is covered again."
     }))
 }
 

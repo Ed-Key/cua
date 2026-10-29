@@ -111,8 +111,8 @@ pub(crate) fn delivery_note(route: PixelClickRoute) -> &'static str {
         _ => {
             "background CGEvent routed to the pid; the hardware pointer was not moved, \
              so apps that read the pointer position may not receive it at the target; \
-             not driver-verified — confirm via screenshot and retry with \
-             delivery_mode:\"foreground\" if nothing changed"
+             not driver-verified: read the window again to confirm; if it did not land, \
+             click the element by element_token (accessibility, also from behind)"
         }
     }
 }

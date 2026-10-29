@@ -198,6 +198,124 @@ fn wait_outcome(
     }
 }
 
+/// Chromium-family decision per process lifetime (the check reads the app's
+/// name, bundle id and bundle layout; refreshes call it on every read).
+static CHROMIUM_FAMILY: LazyLock<Mutex<HashMap<i32, (ProcessStartStamp, bool)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn chromium_family_cached(pid: i32) -> bool {
+    let Some(stamp) = process_start_stamp(pid) else {
+        return false;
+    };
+    let cached = CHROMIUM_FAMILY.lock().ok().and_then(|map| map.get(&pid).copied());
+    if let Some((cached_stamp, family)) = cached {
+        if cached_stamp == stamp {
+            return family;
+        }
+    }
+    let family = is_chromium_family(pid);
+    if let Ok(mut map) = CHROMIUM_FAMILY.lock() {
+        map.insert(pid, (stamp, family));
+    }
+    family
+}
+
+const REFRESH_BUDGET: Duration = Duration::from_millis(250);
+const REFRESH_PROBE_NODES: u32 = 60;
+/// Time for the page to publish after the request (VM B, item 42: the
+/// covered fixture's value changed 2 to 27 ms after it, 4 rounds).
+const REFRESH_SETTLE: Duration = Duration::from_millis(40);
+
+/// Bring a Chromium-family window's page accessibility tree up to date
+/// before it is read. Chromium treats the page of a fully covered window as
+/// hidden and stops publishing its accessibility updates; each later input
+/// then publishes only the state from before it, so a read after an action
+/// shows the old text and focus (item 42: a covered Electron 44 composer read
+/// its placeholder for 6 s after typing). Any accessibility action addressed
+/// to the page publishes the pending state at once. AXScrollToVisible on the
+/// window's top AXWebArea is the one that changes nothing on screen (an
+/// AXSelectedTextRange or AXFocused write can move a caret or focus to a
+/// stale element). No-op for other apps, a window without a page, or an app
+/// that does not answer within the budget.
+pub(crate) fn refresh_page(pid: i32, window_id: u32) {
+    if !chromium_family_cached(pid) {
+        return;
+    }
+    let deadline = Instant::now() + REFRESH_BUDGET;
+    unsafe {
+        let Some(app) = ProbeApp::new(pid) else {
+            return;
+        };
+        if !bound_by(app.0, deadline) {
+            return;
+        }
+        let mut window = None;
+        for candidate in copy_ax_windows(app.0) {
+            if window.is_none()
+                && bound_by(candidate, deadline)
+                && super::bindings::ax_get_window_id(candidate) == Some(window_id)
+            {
+                window = Some(candidate);
+            } else {
+                CFRelease(candidate as CFTypeRef);
+            }
+        }
+        let Some(window) = window else {
+            return;
+        };
+        let mut visits = REFRESH_PROBE_NODES;
+        let area = bound_by(window, deadline)
+            .then(|| first_web_area(copy_children(window), WEB_AREA_MAX_DEPTH, &mut visits, deadline))
+            .flatten();
+        CFRelease(window as CFTypeRef);
+        let Some(area) = area else {
+            return;
+        };
+        if bound_by(area, deadline) {
+            super::bindings::perform_action(area, "AXScrollToVisible");
+        }
+        CFRelease(area as CFTypeRef);
+    }
+    std::thread::sleep(REFRESH_SETTLE);
+}
+
+/// The first AXWebArea in `children` (breadth first by level), retained.
+unsafe fn first_web_area(
+    children: Vec<AXUIElementRef>,
+    depth: u32,
+    visits: &mut u32,
+    deadline: Instant,
+) -> Option<AXUIElementRef> {
+    let mut found = None;
+    let mut next = Vec::new();
+    for child in children {
+        if found.is_none() && depth > 0 && *visits > 0 && bound_by(child, deadline) {
+            *visits -= 1;
+            if copy_string_attr(child, "AXRole").as_deref() == Some(WEB_AREA_ROLE) {
+                found = Some(child);
+                continue;
+            }
+            next.push(child);
+            continue;
+        }
+        CFRelease(child as CFTypeRef);
+    }
+    let mut grandchildren = Vec::new();
+    for parent in next {
+        if found.is_none() && bound_by(parent, deadline) {
+            grandchildren.extend(copy_children(parent));
+        }
+        CFRelease(parent as CFTypeRef);
+    }
+    if found.is_some() || grandchildren.is_empty() || depth <= 1 {
+        for child in grandchildren {
+            CFRelease(child as CFTypeRef);
+        }
+        return found;
+    }
+    first_web_area(grandchildren, depth - 1, visits, deadline)
+}
+
 /// Whether this process's most recent web-content wait timed out: the driver
 /// asked for its page accessibility tree and no web area appeared in time.
 pub fn web_content_wait_timed_out(pid: i32) -> bool {

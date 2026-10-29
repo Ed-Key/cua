@@ -1425,6 +1425,9 @@ struct Pass {
 }
 
 unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
+    // A covered Chromium page publishes its pending state first (item 42),
+    // before the read budget starts.
+    crate::ax::enablement::refresh_page(scope.pid, scope.window_id);
     let mut reader = Reader::new();
     let mut facts = Facts::default();
     let app = AXUIElementCreateApplication(scope.pid);

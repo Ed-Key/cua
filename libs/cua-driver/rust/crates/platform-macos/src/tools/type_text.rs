@@ -61,8 +61,9 @@ fn def() -> &'static ToolDef {
         description:
             "Insert text at an element (element_token) or the \
              focused element. A web page field works in the background by element_token or \
-             x,y: the field is focused and gets key events. For Electron fields pass x,y \
-             screenshot pixels: it clicks there for real focus, then types. No special keys (use \
+             x,y: the field is focused and gets key events, Electron's included. A line \
+             break into a multi-line page field is sent as Shift+Return (most editors take it \
+             as a line break; a page can bind it to send). No other special keys (use \
              press_key). If unverifiable, re-read before retrying to avoid duplicate text. \
              Details: skill://cua-driver/MACOS.md"
             .into(),
@@ -330,6 +331,54 @@ impl Tool for TypeTextTool {
             return stopped_at_deadline_result(None, 0, text.chars().count());
         }
 
+        // ── Electron page field by element_token, from behind ──
+        // Focus it the way the px form does (a background focus click at its
+        // centre), then type with keys into the addressed field, whose focus
+        // the key rung proves: Chromium ignores the AX text write (item 42).
+        let electron_field = match (element_guard.as_ref(), px, window_id, delivery_mode.is_foreground()) {
+            (Some((guard, idx)), None, Some(wid), false)
+                if crate::browser::electron_js::ElectronJs::is_electron(pid) =>
+            {
+                let (guard, idx) = (guard.clone(), *idx);
+                tokio::task::spawn_blocking(move || {
+                    electron_web_field_center(pid, wid, guard.as_ptr(), idx)
+                })
+                .await
+                .ok()
+                .flatten()
+            }
+            _ => None,
+        };
+        if let (Some((cx, cy)), Some(wid)) = (electron_field, window_id) {
+            if let BackgroundKeyboardPolicy::SemanticOnly(ref refusal) = keyboard_policy {
+                return super::background_refusal_result(pid, wid, refusal);
+            }
+            if let Err(e) = super::focus_by_pixel(
+                &self.state,
+                pid,
+                window_id,
+                cx,
+                cy,
+                false,
+                args.opt_str("session"),
+                args.opt_str("_session_id"),
+                false,
+                true,
+                _mutation_lease.as_ref(),
+                background_focus.as_ref(),
+            )
+            .await
+            {
+                return e;
+            }
+            // The page takes the field's focus once its window is made key
+            // for the keys; the key rung proves it then, and again right
+            // before the first key (a covered page reports the page itself
+            // focused until that moment).
+        }
+        // The field keeps its identity through delivery: the key rung proves
+        // it still holds focus right before the first key, and reads it back.
+
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
         // field to give the Chromium/Electron renderer the real keyboard focus the
@@ -405,7 +454,8 @@ impl Tool for TypeTextTool {
                 _ => {}
             }
         }
-        let used_pixel_focus = px.is_some() && py.is_some() && page_field.is_none();
+        let used_pixel_focus =
+            (px.is_some() && py.is_some() && page_field.is_none()) || electron_field.is_some();
         let element_ptr = element_guard
             .as_ref()
             .map(|(g, idx)| (g.as_ptr(), Some(*idx)))
@@ -509,6 +559,7 @@ impl Tool for TypeTextTool {
                             keyboard_policy: blocking_policy,
                             prepare_native_text,
                             deadline,
+                            proven_web_field: electron_field.is_some(),
                         },
                     )
                 })
@@ -578,9 +629,16 @@ impl Tool for TypeTextTool {
                 }))
             }
             Ok(Ok(outcome)) => {
+                // The call's own web decision, not a fresh ancestry read.
                 let target_is_web_content = outcome.verified
                     && path_has_untrusted_web_readback(outcome.path)
-                    && target_in_web_area(pid, element_ptr, window_id);
+                    && outcome.web != Web::No;
+                let uncertain = if outcome.web == Web::Unknown {
+                    "\nWhether this field is web content could not be read, so it was typed as web \
+                     content: by keys, with no retryable count."
+                } else {
+                    ""
+                };
                 let surface = if !target_is_web_content {
                     WebSurface::Other
                 } else if crate::browser::electron_js::ElectronJs::is_electron(pid) {
@@ -596,7 +654,7 @@ impl Tool for TypeTextTool {
                     target_is_web_content,
                     surface,
                     used_pixel_focus,
-                    &changes.result_suffix(),
+                    &format!("{uncertain}{}", changes.result_suffix()),
                 );
                 // A field its app saves only when editing ends (Finder's
                 // Get Info, its rename field): the text shows, nothing is
@@ -660,6 +718,7 @@ fn completed_typing_result(
         verified,
         delivered_chars,
         unconfirmed,
+        web: _,
     } = outcome;
     // SURFACE-AWARE VERIFICATION. On any web-content surface (Chromium,
     // WebKit, Electron) AXValue is not independent renderer evidence: it can
@@ -1062,7 +1121,7 @@ fn electron_background_ax_refusal(
     }
     Some(BackgroundRefusal {
         code: "background_unavailable",
-        reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; use the pixel-targeted type_text form (x,y), which stays in the background, or delivery_mode:\"foreground\", which brings the app to the front."
+        reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; its centre could not be resolved on the window. Use the pixel-targeted type_text form (x,y) on the field, which also stays in the background."
             .to_owned(),
         advice: Some("px"),
     })
@@ -1420,6 +1479,9 @@ struct TypeTextOutcome {
     delivered_chars: Option<usize>,
     /// The missing evidence behind `verified: false`, stated in the summary.
     unconfirmed: Option<Unconfirmed>,
+    /// The call's web decision (see [`TypingDecision`]), for the result's
+    /// read-back policy.
+    web: Web,
 }
 
 /// Why a completed, non-partial delivery is not confirmed.
@@ -1522,6 +1584,10 @@ struct TypingReadback {
 
 impl TypingReadback {
     fn capture(pid: i32, element: Option<(usize, Option<usize>)>, window_id: Option<u32>) -> Self {
+        // The focused editor is retained here: read it from a current tree.
+        if let Some(wid) = window_id {
+            crate::ax::enablement::refresh_page(pid, wid);
+        }
         let mut readback = Self {
             pid,
             element,
@@ -1534,8 +1600,17 @@ impl TypingReadback {
             before: None,
             before_range: None,
         };
-        (readback.before, readback.before_range) = readback.sample();
+        (readback.before, readback.before_range) = readback.read_sample();
         readback
+    }
+
+    /// The AX role of the field this read-back watches.
+    fn role(&self) -> String {
+        let ptr = self
+            .element
+            .map(|(ptr, _)| ptr as AXUIElementRef)
+            .or_else(|| self.focused.as_ref().map(|el| el.as_CFTypeRef() as AXUIElementRef));
+        ptr.and_then(|ptr| unsafe { copy_string_attr(ptr, "AXRole") }).unwrap_or_default()
     }
 
     fn selection(&self) -> Option<TextSelectionRange> {
@@ -1551,6 +1626,21 @@ impl TypingReadback {
     }
 
     fn sample(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<TextSelectionRange>,
+    ) {
+        // A covered Chromium page reads its state from before the keys until
+        // it is asked to publish (item 42).
+        if let Some(wid) = self.window_id {
+            crate::ax::enablement::refresh_page(self.pid, wid);
+        }
+        self.read_sample()
+    }
+
+    /// [`Self::sample`] without the page refresh (right after one).
+    fn read_sample(
         &self,
     ) -> (
         Option<String>,
@@ -1624,6 +1714,220 @@ fn web_readback_is_untrusted(classification: WebAreaClassification) -> bool {
         classification,
         WebAreaClassification::WebContent | WebAreaClassification::WindowFocusUnavailable
     )
+}
+
+/// The window pixel (native capture pixels) at the centre of an Electron
+/// page field, when `element` is one: proven web content with an on-window
+/// frame.
+fn electron_web_field_center(pid: i32, window_id: u32, element: usize, idx: usize) -> Option<(f64, f64)> {
+    // Proven web content only: delivery's focus checks and key route key off
+    // the same classification, so an unproven ancestry keeps the refusal.
+    if classify_target_web_area(pid, Some((element, Some(idx))), Some(window_id)) != WebAreaClassification::WebContent {
+        return None;
+    }
+    // Only a field takes text: a button or the page itself would take the
+    // keys as shortcuts, so those keep the refusal.
+    let role = unsafe { copy_string_attr(element as AXUIElementRef, "AXRole") }.unwrap_or_default();
+    let editable = unsafe { crate::ax::bindings::copy_element_attr(element as AXUIElementRef, "AXEditableAncestor") }
+        .map(|ancestor| unsafe { CFRelease(ancestor as CFTypeRef) })
+        .is_some();
+    if !takes_text(&role, editable) {
+        return None;
+    }
+    let (screen_x, screen_y) = unsafe { crate::ax::bindings::element_screen_center(element as AXUIElementRef) }?;
+    let frame = super::px_frame::resolve_window_px_frame(window_id).ok()?;
+    Some(((screen_x - frame.bounds.x) * frame.scale, (screen_y - frame.bounds.y) * frame.scale))
+}
+
+/// Whether a type_text target is web content, settled once per call (see
+/// [`TypingDecision`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Web {
+    Yes,
+    No,
+    /// Its ancestry could not be read: treated as web content (keys, never
+    /// the AX write, no retryable partial count), and the result says so.
+    Unknown,
+}
+
+/// What the call's target was when the read-back retained it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Began {
+    /// A specific element (an addressed one, or the focused field).
+    Field,
+    /// The page itself held focus (an AXWebArea): its own field is known
+    /// only once the window takes key focus for the keys.
+    Page,
+    /// No readable target.
+    Unread,
+}
+
+/// The one web/line-break decision of a type_text call (item 42). Settled
+/// once, right after the read-back retains its target (after a page
+/// refresh), and read by every later step: the AX-write filter, the
+/// native-field preparation, the focus proofs, the key path's last check,
+/// the partial-count accounting and the read-back policy of the result.
+/// Nothing reclassifies the target later; a later ancestry read that fails
+/// or recovers changes nothing. The key path's last check before the first
+/// key only checks identity against it.
+///
+/// | target at capture | ancestry read | web | AX write | focus proofs | short read-back | line break |
+/// |---|---|---|---|---|---|---|
+/// | a field in web content | complete | Yes | no | yes | unknown, not retryable | Shift+Return in AXTextArea, else character |
+/// | an Electron token proven before its focus click | fails later | Yes | no | yes | unknown | as above |
+/// | a native field | complete | No | yes | no | counted, retryable | character |
+/// | any, in a Chromium-family app | Incomplete (then recovers or not) | Unknown | no | yes | unknown | character; the result says the classification was uncertain |
+/// | any, in another app | Incomplete | No | yes | no | counted | character (as before item 42) |
+///
+/// Untargeted keys from behind, last check before the first key (rows of
+/// [`last_check`]; foreground skips the identity rows because fronting the
+/// window moves its focus by design):
+///
+/// | began | focus now | outcome |
+/// |---|---|---|
+/// | Field | the same element, a field | keys, the decision's line break |
+/// | (foreground) any | a different element | keys, line break from that element's role |
+/// | Field | another element, the page, or unreadable | refused, no key |
+/// | Page | the page itself | keys (they reach its focused element), character line break |
+/// | Page | a field (the page reported it once its window took key focus) | keys, line break from that field's role if web is Yes |
+/// | Page | a control (button, select-only combo) | refused |
+/// | Unread (nothing retained) | a field | keys, character line break |
+/// | Unread | anything else | refused |
+/// | (web No) | anything | keys, as before item 42 |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TypingDecision {
+    web: Web,
+    began: Began,
+    line_breaks: crate::input::keyboard::LineBreaks,
+}
+
+impl TypingDecision {
+    /// `proven`: an earlier proof that the target is web content (the
+    /// Electron token's, before its focus click). `role`: the target's role
+    /// ("" when unreadable or no target).
+    /// `chromium`: the process is Chromium-family (Chrome, Electron), the
+    /// only one whose unreadable ancestry is taken as possibly web content;
+    /// elsewhere it stays native, as before item 42.
+    /// `retained`: the read-back retained a target (an unreadable role then
+    /// still counts as a specific field, never as no target).
+    fn settle(proven: bool, classification: WebAreaClassification, role: &str, chromium: bool, retained: bool) -> Self {
+        let web = if proven || classification == WebAreaClassification::WebContent {
+            Web::Yes
+        } else if classification == WebAreaClassification::NonWebContent || !chromium {
+            Web::No
+        } else {
+            Web::Unknown
+        };
+        let began = match role {
+            "AXWebArea" => Began::Page,
+            "" if !retained => Began::Unread,
+            _ => Began::Field,
+        };
+        Self { web, began, line_breaks: line_breaks_for(web == Web::Yes, role) }
+    }
+
+    /// A native target: the decision before item 42 (terminals, tests).
+    fn native() -> Self {
+        Self { web: Web::No, began: Began::Field, line_breaks: crate::input::keyboard::LineBreaks::Characters }
+    }
+
+    /// The web rules apply: keys instead of the AX write, focus proofs, a
+    /// short read-back that is unknown rather than a retryable count.
+    fn web_rules(self) -> bool {
+        self.web != Web::No
+    }
+}
+
+/// The key path's last check before the first key of an untargeted call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastCheck {
+    Keys(crate::input::keyboard::LineBreaks),
+    Refuse,
+}
+
+/// See the second table of [`TypingDecision`]. `same`: whether the element
+/// focused now is the one retained at capture (`None`: focus unreadable);
+/// `role`, `editable`: the element focused now.
+fn last_check(decision: TypingDecision, background: bool, same: Option<bool>, role: &str, editable: bool) -> LastCheck {
+    use crate::input::keyboard::LineBreaks;
+    if decision.web == Web::No {
+        return LastCheck::Keys(decision.line_breaks);
+    }
+    let field = takes_text(role, editable);
+    // The line break follows the element the keys will reach: the retained
+    // one keeps the decision's mode; any other (the field a page reports,
+    // or focus moved by fronting) takes its own role, never a stale
+    // Shift+Return a single-line field would submit on.
+    let line_breaks = match same {
+        Some(true) => decision.line_breaks,
+        _ if decision.web == Web::Yes => line_breaks_for(true, role),
+        _ => LineBreaks::Characters,
+    };
+    if !background {
+        return LastCheck::Keys(line_breaks);
+    }
+    let allowed = match (decision.began, same) {
+        (_, None) => false,
+        (Began::Field, Some(same)) => same && field,
+        (Began::Page, Some(_)) => role == "AXWebArea" || field,
+        (Began::Unread, Some(_)) => field,
+    };
+    if allowed {
+        LastCheck::Keys(line_breaks)
+    } else {
+        LastCheck::Refuse
+    }
+}
+
+/// Reads the element focused now for [`last_check`] (after a page refresh).
+fn last_check_now(pid: i32, readback: &TypingReadback, decision: TypingDecision, background: bool) -> LastCheck {
+    if decision.web == Web::No {
+        return LastCheck::Keys(decision.line_breaks);
+    }
+    if let Some(wid) = readback.window_id {
+        crate::ax::enablement::refresh_page(pid, wid);
+    }
+    unsafe {
+        let current = match readback.window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => focused_element_of_pid(pid),
+        };
+        let Some(current) = current else {
+            return last_check(decision, background, None, "", false);
+        };
+        let role = copy_string_attr(current, "AXRole").unwrap_or_default();
+        let editable = crate::ax::bindings::copy_element_attr(current, "AXEditableAncestor")
+            .map(|e| CFRelease(e as CFTypeRef))
+            .is_some();
+        let same = readback
+            .focused
+            .as_ref()
+            .is_some_and(|original| CFEqual(original.as_CFTypeRef(), current as CFTypeRef) != 0);
+        CFRelease(current as CFTypeRef);
+        last_check(decision, background, Some(same), &role, editable)
+    }
+}
+
+/// Whether an element of `role` (with or without an editable ancestor) is a
+/// field that takes typed text.
+fn takes_text(role: &str, editable_ancestor: bool) -> bool {
+    // Chromium exposes a select-only menu button as AXComboBox too: only an
+    // editable one takes text.
+    matches!(role, "AXTextField" | "AXTextArea" | "AXSearchField")
+        || (editable_ancestor && role != "AXWebArea")
+}
+
+/// How a line break is typed: Shift+Return into a multi-line web field (a
+/// textarea or a contenteditable editor, both AXTextArea), where a "\n"
+/// character event inserts nothing (item 42); a character elsewhere. A
+/// single-line page field keeps the character: Shift+Return there submits
+/// its form.
+fn line_breaks_for(web: bool, role: &str) -> crate::input::keyboard::LineBreaks {
+    if web && role == "AXTextArea" {
+        crate::input::keyboard::LineBreaks::ShiftReturn
+    } else {
+        crate::input::keyboard::LineBreaks::Characters
+    }
 }
 
 fn electron_background_ax_ancestry_is_unsafe(classification: WebAreaClassification) -> bool {
@@ -1731,6 +2035,7 @@ fn cgevent_type_verified(
     settle_ms: u64,
     deadline: std::time::Instant,
     web_field: bool,
+    decision: TypingDecision,
 ) -> anyhow::Result<Keyed> {
     // Background field focus ran inside protected preparation before recipient resolution.
     if settle_ms > 0 {
@@ -1783,11 +2088,23 @@ fn cgevent_type_verified(
             return Err(WebFieldNotFocused.into());
         }
     }
+    // Untargeted keys: the last check before the first key, against the
+    // call's decision (see [`TypingDecision`]); addressed keys were proven
+    // focused just above.
+    let line_breaks = if element_ptr_and_idx.is_none() {
+        match last_check_now(pid, readback, decision, settle_ms == 0) {
+            LastCheck::Refuse => return Err(WebFieldNotFocused.into()),
+            LastCheck::Keys(mode) => mode,
+        }
+    } else {
+        decision.line_breaks
+    };
     let posted = crate::input::keyboard::type_text_with_delay(
         recipient_pid,
         text,
         delay_ms,
         Some(deadline),
+        line_breaks,
     )?;
     if posted < text.chars().count() {
         // Let what was posted land before answering, so the read that
@@ -1932,6 +2249,10 @@ struct KeyboardRoute {
     prepare_native_text: bool,
     /// When key posting must stop (see [`posting_deadline`]).
     deadline: std::time::Instant,
+    /// The addressed element was proven an Electron page field before its
+    /// focus click: delivery keeps the web-field rules (keys only, focus
+    /// proofs) even if a later ancestry read fails.
+    proven_web_field: bool,
 }
 
 /// Best-effort-background ladder for `type_text`.
@@ -1960,6 +2281,7 @@ fn type_text_blocking(
         keyboard_policy,
         prepare_native_text,
         deadline,
+        proven_web_field,
     } = route;
     // The worker can start after the deadline (the async side checked it
     // before its last await): then nothing is sent, on any route.
@@ -1997,12 +2319,30 @@ fn type_text_blocking(
     if let (None, Some(wid), false) = (element_ptr_and_idx, window_id, delivery_mode.is_foreground()) {
         settle_web_area_focus(pid, wid);
     }
-    // An addressed field in a web page (outside Electron, which keeps its own
-    // rules): its keys are guarded by a focus proof on either route.
-    let is_electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
-    let addressed_web_field =
-        element_ptr_and_idx.is_some() && !is_electron && target_in_web_area(pid, element_ptr_and_idx, window_id);
+    // An addressed field in web content: its keys are guarded by a focus
+    // proof on either route. A token-addressed Electron field reaches here
+    // only after its pixel focus was proven (item 42).
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
+    // The call's one web decision (see [`TypingDecision`]): the target is the
+    // addressed element, or the field the read-back retained.
+    let decision = {
+        let target = element_ptr_and_idx.or_else(|| {
+            readback.focused.as_ref().map(|focused| (focused.as_CFTypeRef() as usize, None))
+        });
+        let classification = if target.is_some() {
+            classify_target_web_area(pid, target, window_id)
+        } else {
+            WebAreaClassification::Incomplete
+        };
+        TypingDecision::settle(
+            proven_web_field,
+            classification,
+            &readback.role(),
+            crate::ax::enablement::chromium_family_cached(pid),
+            target.is_some(),
+        )
+    };
+    let addressed_web_field = element_ptr_and_idx.is_some() && decision.web_rules();
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -2055,6 +2395,7 @@ fn type_text_blocking(
                 foreground_settle_ms,
                 deadline,
                 addressed_web_field,
+                decision,
             )
         };
         let (keyed, fronted) = match window_id {
@@ -2133,12 +2474,13 @@ fn type_text_blocking(
             delivered_chars,
             unconfirmed,
             text.chars().count(),
-            target_in_web_area(pid, element_ptr_and_idx, window_id),
+            decision.web_rules(),
         );
         // Only claim the `_fg` path when a front actually happened; when no
         // foregrounding occurred (no window, or SPIs unavailable) these were
         // background keystrokes and `path` must say so honestly.
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+            web: decision.web,
             detail: format!(" via foreground keystrokes ({delay_ms}ms delay)"),
             path: if fronted {
                 PATH_KEY_EVENTS_FG
@@ -2178,6 +2520,7 @@ fn type_text_blocking(
                     /*settle_ms=*/ 0,
                     deadline,
                     false,
+                    TypingDecision::native(),
                 )
             },
         )?;
@@ -2193,6 +2536,7 @@ fn type_text_blocking(
             }
         };
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+            web: decision.web,
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
             path: PATH_KEY_EVENTS,
             verified,
@@ -2225,11 +2569,12 @@ fn type_text_blocking(
     // Safari write of 32 landed). A focused element that is not a text control
     // (a web area, a button) cannot take text at all. Both go straight to key
     // events, which reach whatever holds keyboard focus the way a user's
-    // typing does. Electron keeps its own AX rules (see above).
-    let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
+    // typing does. Electron's page is web content too: Chromium accepts the
+    // write into its contenteditable or textarea and inserts nothing (item 42).
+    let ax_target = ax_target.filter(|&(element, owns, _)| {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-        let web_page = !is_electron
-            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        // The AX write's target is the decision's target: never reclassified.
+        let web_page = decision.web_rules();
         let keep = ax_text_write_first(&role, owns, web_page);
         if !keep && owns {
             unsafe { CFRelease(element as CFTypeRef) };
@@ -2274,7 +2619,7 @@ fn type_text_blocking(
                 role.as_str(),
                 "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
             )
-            && !target_in_web_area(pid, element_ptr_and_idx, window_id)
+            && decision.web == Web::No
             && !crate::input::ax_actions::is_element_focused(pid, element as usize)
         {
             let prepare_element = || crate::input::ax_actions::focus_element(element as usize);
@@ -2319,8 +2664,7 @@ fn type_text_blocking(
         // AXValue is not renderer evidence in web content. An unchanged echo
         // there cannot prove that zero characters landed, so blind retry is
         // unsafe even though no synthesis has run yet.
-        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
-            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged) && decision.web_rules();
         if owns {
             unsafe {
                 CFRelease(element as _);
@@ -2329,6 +2673,7 @@ fn type_text_blocking(
         if ax_progress == Some(TypedProgress::Complete) {
             let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                web: decision.web,
                 detail: format!(" into{idx_str} {role} \"{title}\""),
                 path: PATH_AX,
                 verified: true,
@@ -2339,6 +2684,7 @@ fn type_text_blocking(
         if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
             let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                web: decision.web,
                 detail: format!(" via partial AX write into{idx_str} {role} \"{title}\""),
                 path: PATH_AX,
                 verified: false,
@@ -2363,6 +2709,7 @@ fn type_text_blocking(
                 Unconfirmed::from_readback(readback.before.as_deref(), readback.read().as_deref())
             };
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                web: decision.web,
                 detail: format!(" via accepted AX write into {role} \"{title}\""),
                 path: PATH_AX,
                 verified: false,
@@ -2434,6 +2781,7 @@ fn type_text_blocking(
                 /*settle_ms=*/ 0,
                 deadline,
                 addressed_web_field,
+                decision,
             )
         },
     )?;
@@ -2452,9 +2800,10 @@ fn type_text_blocking(
         delivered_chars,
         unconfirmed,
         text.chars().count(),
-        target_in_web_area(pid, element_ptr_and_idx, window_id),
+        decision.web_rules(),
     );
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+        web: decision.web,
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
         path: PATH_KEY_EVENTS,
         verified,
@@ -2545,6 +2894,19 @@ fn focused_web_field(pid: i32, window_id: u32) -> FocusedWebField {
         let electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
         let outcome = if role == "AXWebArea" && !electron {
             FocusedWebField::PageOnly
+        } else if electron
+            && role != "AXWebArea"
+            && target_in_web_area(pid, Some((focused as usize, None)), Some(window_id))
+            && !takes_text(&role, {
+                let editable = crate::ax::bindings::copy_element_attr(focused, "AXEditableAncestor");
+                editable.map(|e| CFRelease(e as CFTypeRef)).is_some()
+            })
+        {
+            // A focused Electron page control (a select-only combo box, a
+            // button) takes keys as its own commands: Chromium ignored the AX
+            // text write these used to get, keys would act (item 42). The
+            // page itself keeps today's keys, which reach its focused field.
+            FocusedWebField::PageOnly
         } else if !is_text_entry_role(&role)
             && !electron
             && target_in_web_area(pid, Some((focused as usize, None)), Some(window_id))
@@ -2621,6 +2983,7 @@ fn web_text_field_at_window_pixel(
 /// briefly for it to move, so the read-back watches the field the keys reach
 /// rather than reporting it unreadable.
 fn settle_web_area_focus(pid: i32, window_id: u32) {
+    crate::ax::enablement::refresh_page(pid, window_id);
     let deadline = std::time::Instant::now() + WEB_FOCUS_TIMEOUT;
     loop {
         let role = unsafe {
@@ -2698,7 +3061,8 @@ fn is_text_entry_role(role: &str) -> bool {
 
 /// Whether an AX text write is the first rung for a target with AX `role`.
 /// `implicit`: the window's focused element rather than an addressed one.
-/// `web_page`: the target is in a web page outside Electron.
+/// `web_page`: the target is in web content (a browser page or an Electron
+/// app's page).
 fn ax_text_write_first(role: &str, implicit: bool, web_page: bool) -> bool {
     !web_page && (is_text_entry_role(role) || !implicit)
 }
@@ -2772,6 +3136,91 @@ mod tests {
             web_shortfall_is_unknown(None, Some(Unreadable), 5, true),
             (None, Some(Unreadable))
         );
+    }
+
+    /// Item 42: an Electron page element addressed by token is focused and
+    /// typed into only when it is a field; a button or the page is refused.
+    #[test]
+    fn only_fields_take_token_typing_on_an_electron_page() {
+        assert!(takes_text("AXTextArea", false));
+        assert!(takes_text("AXTextField", true));
+        assert!(takes_text("AXStaticText", true), "a rich editor's own text node");
+        assert!(!takes_text("AXButton", false));
+        assert!(!takes_text("AXWebArea", true));
+        assert!(!takes_text("AXGroup", false));
+        assert!(!takes_text("AXComboBox", false), "a select-only menu button");
+        assert!(takes_text("AXComboBox", true));
+    }
+
+    /// Item 42, first table of [`TypingDecision`]: one decision per call.
+    #[test]
+    fn the_web_decision_rows() {
+        use crate::input::keyboard::LineBreaks;
+        use WebAreaClassification::*;
+        let d = TypingDecision::settle(false, WebContent, "AXTextArea", true, true);
+        assert_eq!((d.web, d.began, d.line_breaks), (Web::Yes, Began::Field, LineBreaks::ShiftReturn));
+        assert!(d.web_rules());
+        let d = TypingDecision::settle(false, WebContent, "AXTextField", true, true);
+        assert_eq!(d.line_breaks, LineBreaks::Characters, "a single-line page field");
+        let d = TypingDecision::settle(true, Incomplete, "AXTextArea", true, true);
+        assert_eq!((d.web, d.line_breaks), (Web::Yes, LineBreaks::ShiftReturn), "a proven Electron token");
+        let d = TypingDecision::settle(false, NonWebContent, "AXTextArea", true, true);
+        assert_eq!((d.web, d.line_breaks), (Web::No, LineBreaks::Characters));
+        assert!(!d.web_rules(), "a native field keeps the AX write and its retryable count");
+        for unknown in [Incomplete, WindowFocusUnavailable] {
+            let d = TypingDecision::settle(false, unknown, "AXTextArea", true, true);
+            assert_eq!((d.web, d.line_breaks), (Web::Unknown, LineBreaks::Characters));
+            assert!(d.web_rules(), "unknown takes the safe side: keys, no retryable count");
+        }
+        assert_eq!(TypingDecision::settle(false, WebContent, "AXWebArea", true, true).began, Began::Page);
+        assert_eq!(TypingDecision::settle(false, Incomplete, "AXTextArea", false, true).web, Web::No, "another app's unreadable ancestry stays native");
+        assert_eq!(TypingDecision::settle(false, Incomplete, "", true, false).began, Began::Unread);
+        assert_eq!(TypingDecision::settle(false, WebContent, "", true, true).began, Began::Field, "a retained field whose role read failed");
+    }
+
+    /// Item 42, second table of [`TypingDecision`]: the last check before
+    /// the first key of an untargeted call.
+    #[test]
+    fn the_last_check_rows() {
+        use crate::input::keyboard::LineBreaks::*;
+        use WebAreaClassification::*;
+        let field = TypingDecision::settle(false, WebContent, "AXTextArea", true, true);
+        let page = TypingDecision::settle(false, WebContent, "AXWebArea", true, true);
+        let unread = TypingDecision::settle(false, Incomplete, "", true, false);
+        let native = TypingDecision::settle(false, NonWebContent, "AXTextArea", true, true);
+        let k = LastCheck::Keys;
+        // began on a field
+        assert_eq!(last_check(field, true, Some(true), "AXTextArea", false), k(ShiftReturn));
+        assert_eq!(last_check(field, true, Some(false), "AXTextArea", false), LastCheck::Refuse, "another field");
+        assert_eq!(last_check(field, true, Some(false), "AXWebArea", false), LastCheck::Refuse, "focus lost to the page");
+        assert_eq!(last_check(field, true, None, "", false), LastCheck::Refuse, "unreadable");
+        // began on the page
+        assert_eq!(last_check(page, true, Some(true), "AXWebArea", false), k(Characters));
+        assert_eq!(last_check(page, true, Some(false), "AXTextArea", false), k(ShiftReturn), "the field the page reports");
+        assert_eq!(last_check(page, true, Some(false), "AXTextField", false), k(Characters));
+        assert_eq!(last_check(page, true, Some(false), "AXComboBox", false), LastCheck::Refuse, "a select-only control");
+        assert_eq!(last_check(page, true, Some(false), "AXButton", false), LastCheck::Refuse);
+        // began unread
+        assert_eq!(last_check(unread, true, Some(false), "AXTextArea", false), k(Characters));
+        assert_eq!(last_check(unread, true, Some(false), "AXButton", false), LastCheck::Refuse);
+        // foreground: no identity rows
+        assert_eq!(last_check(field, false, Some(true), "AXTextArea", false), k(ShiftReturn));
+        assert_eq!(last_check(field, false, Some(false), "AXTextField", false), k(Characters), "fronting moved focus to a single-line field");
+        assert_eq!(last_check(page, false, Some(false), "AXTextArea", false), k(ShiftReturn));
+        // native: unchanged
+        assert_eq!(last_check(native, true, None, "", false), k(Characters));
+    }
+
+    /// Item 42: a line break into a multi-line web field is Shift+Return;
+    /// a single-line field, or anywhere else, keeps the character.
+    #[test]
+    fn web_content_line_breaks_are_shift_return() {
+        use crate::input::keyboard::LineBreaks;
+        assert_eq!(line_breaks_for(true, "AXTextArea"), LineBreaks::ShiftReturn);
+        for role in ["AXTextField", "AXSearchField", "AXComboBox", "AXWebArea", ""] {
+            assert_eq!(line_breaks_for(true, role), LineBreaks::Characters, "{role}");
+        }
+        assert_eq!(line_breaks_for(false, "AXTextArea"), LineBreaks::Characters);
     }
 
     #[test]
@@ -3022,6 +3471,7 @@ mod tests {
     fn typing_summaries_state_the_evidence() {
         use Unconfirmed::*;
         let outcome = |path, verified, delivered_chars, unconfirmed| TypeTextOutcome {
+            web: Web::No,
             detail: " into [1] AXTextArea \"\"".into(),
             path,
             verified,
@@ -3172,6 +3622,7 @@ mod tests {
     fn unknown_web_typing_keeps_the_renderer_route_hint() {
         let result = completed_typing_result(
             TypeTextOutcome {
+                web: Web::No,
                 detail: String::new(),
                 path: PATH_AX,
                 verified: true,
@@ -3193,6 +3644,7 @@ mod tests {
     fn completed_native_typing_preserves_confirmation_and_count() {
         let result = completed_typing_result(
             TypeTextOutcome {
+                web: Web::No,
                 detail: String::new(),
                 path: PATH_AX,
                 verified: true,
@@ -3240,6 +3692,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 prepare_native_text: false,
                 deadline: posting_deadline(),
+                proven_web_field: false,
             },
         );
         match r {
@@ -3269,6 +3722,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
                 deadline: posting_deadline(),
+                proven_web_field: false,
             },
         )
         .expect("accepted AX write must retain an uncertain outcome");
@@ -3317,6 +3771,7 @@ mod tests {
                     keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                     prepare_native_text: true,
                     deadline: posting_deadline(),
+                    proven_web_field: false,
                 },
             )
             .expect("a Catalyst target is decided before any input");
@@ -3377,6 +3832,7 @@ mod tests {
                     keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                     prepare_native_text: true,
                     deadline: posting_deadline(),
+                    proven_web_field: false,
                 },
             )
             .expect("the key rung's budget refusal");
@@ -3515,6 +3971,7 @@ mod tests {
                 settle_ms,
                 std::time::Instant::now(),
                 true,
+                TypingDecision::settle(true, WebAreaClassification::WebContent, "AXTextArea", true, true),
             );
             let case = format!("{role} settle {settle_ms}");
             let error = result.err().unwrap_or_else(|| panic!("{case}: must refuse"));
@@ -3561,6 +4018,7 @@ mod tests {
     fn webkit_typing_points_at_the_page_not_another_route() {
         let result = completed_typing_result(
             TypeTextOutcome {
+                web: Web::No,
                 detail: " via CGEvent (30ms delay)".into(),
                 path: PATH_KEY_EVENTS,
                 verified: true,
@@ -3603,6 +4061,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
                 deadline: posting_deadline(),
+                proven_web_field: false,
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");
@@ -3679,6 +4138,7 @@ mod tests {
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
                 deadline: std::time::Instant::now(),
+                proven_web_field: false,
             },
         )
         .expect("the stop must not touch the invalid pid");
