@@ -902,6 +902,52 @@ fn app_element(pid: i32) -> Result<Element> {
     Ok(Element(app))
 }
 
+/// One pass over the target app's windows, every AX read bounded by `timeout`.
+enum CaptureAttempt {
+    Found(Option<WindowActivation>),
+    Absent,
+    /// The app did not answer a read in time (or its window list read failed).
+    Unanswered,
+    Failed(anyhow::Error),
+}
+
+/// Repeat `attempt` until it settles or WINDOW_CAPTURE_LIMIT runs out. The capture
+/// runs while screen updates are disabled, so the bound covers every attempt; each
+/// attempt is handed the time that remains, and a busy app gets the rest of the
+/// budget instead of one fixed 50 ms read.
+fn capture_within(
+    limit: Duration,
+    host_pid: i32,
+    mut attempt: impl FnMut(Duration) -> CaptureAttempt,
+) -> Result<Option<WindowActivation>> {
+    let started = Instant::now();
+    loop {
+        let remaining = limit.saturating_sub(started.elapsed());
+        let outcome = if remaining.is_zero() {
+            CaptureAttempt::Unanswered
+        } else {
+            attempt(remaining)
+        };
+        // Nothing that settled past the bound is used: screen updates are off.
+        let late = started.elapsed() >= limit;
+        match outcome {
+            CaptureAttempt::Found(found) if !late => return Ok(found),
+            CaptureAttempt::Absent => bail!("native activation window was not found"),
+            CaptureAttempt::Failed(error) => return Err(error),
+            CaptureAttempt::Unanswered if started.elapsed() + POLL < limit => {
+                std::thread::sleep(POLL)
+            }
+            CaptureAttempt::Found(_) | CaptureAttempt::Unanswered => bail!(
+                "native activation window list read failed: the target app (pid {host_pid}) did not \
+                 answer its accessibility window read within {} ms, so the key input was not sent and \
+                 the front app did not change. The app is busy: send the same call again in the \
+                 background; foreground delivery is not needed",
+                limit.as_millis()
+            ),
+        }
+    }
+}
+
 fn capture_activation(
     host: ProcessIdentity,
     window_id: Option<u32>,
@@ -914,55 +960,111 @@ fn capture_activation(
         "native activation window identity is invalid"
     );
     let app = app_element(host.pid)?;
+    let found = capture_within(WINDOW_CAPTURE_LIMIT, host.pid, |timeout| {
+        capture_attempt(&app, host.pid, window_id, timeout)
+    });
+    ensure!(
+        alive(host),
+        "native activation host changed during AX capture"
+    );
+    found
+}
+
+fn capture_attempt(app: &Element, pid: i32, window_id: u32, timeout: Duration) -> CaptureAttempt {
     let started = Instant::now();
+    // Each read gets only the time left in this attempt; false once none is left.
+    let bound = |element: &Element| {
+        let left = timeout.saturating_sub(started.elapsed());
+        unsafe { ax::AXUIElementSetMessagingTimeout(element.0, left.as_secs_f32().max(0.001)) };
+        !left.is_zero()
+    };
+    if !bound(app) {
+        return CaptureAttempt::Unanswered;
+    }
     // The same window list as the exact-target gate: AXWindows plus the
     // requested window recovered by its remote token when it sits on another
     // Space, so a window the gate admitted can also be activated.
-    let (windows, read_failed) =
-        unsafe { ax::copy_ax_windows_including_reporting(app.0, host.pid, window_id) };
+    let (windows, list_error) =
+        unsafe { ax::copy_ax_windows_including_with_error(app.0, pid, window_id) };
     let windows: Vec<_> = windows.into_iter().map(Element).collect();
-    let mut found = None;
+    // A window whose identity read timed out may be the target: the rest are
+    // still checked, and the pass is retried only when no other is the target.
+    let mut unanswered = false;
     for window in windows {
-        ensure!(
-            started.elapsed() < WINDOW_CAPTURE_LIMIT,
-            "native activation window lookup exceeded its capture bound"
-        );
-        unsafe { ax::AXUIElementSetMessagingTimeout(window.0, 0.05) };
-        if unsafe { ax::ax_get_window_id_checked(window.0) }
-            .ok()
-            .flatten()
-            != Some(window_id)
-        {
-            continue;
+        if !bound(&window) {
+            return CaptureAttempt::Unanswered;
+        }
+        match unsafe { ax::ax_get_window_id_checked(window.0) } {
+            Ok(Some(id)) if id == window_id => {}
+            Err(ax::kAXErrorCannotComplete) => {
+                unanswered = true;
+                continue;
+            }
+            _ => continue,
+        }
+        if !bound(&window) {
+            return CaptureAttempt::Unanswered;
         }
         let point = unsafe {
             ax::copy_geometry_attr_checked(window.0, "AXActivationPoint", ax::kAXValueCGPointType)
         };
         let point = match point {
             Ok(point) => point,
-            Err(ax::kAXErrorAttributeUnsupported | ax::kAXErrorNoValue) => return Ok(None),
-            Err(error) => bail!("native AXActivationPoint read failed: {error}"),
+            Err(ax::kAXErrorAttributeUnsupported | ax::kAXErrorNoValue) => {
+                return CaptureAttempt::Found(None)
+            }
+            Err(ax::kAXErrorCannotComplete) => return CaptureAttempt::Unanswered,
+            Err(error) => {
+                return CaptureAttempt::Failed(anyhow::anyhow!(
+                    "native AXActivationPoint read failed: {error}"
+                ))
+            }
         };
-        let bounds = unsafe { ax::element_screen_rect(window.0) }
-            .context("native window-aware activation bounds are unavailable")?;
-        found = Some(WindowActivation {
+        let mut frame = [[0.0; 2]; 2];
+        for (slot, (attribute, kind)) in frame.iter_mut().zip([
+            ("AXPosition", ax::kAXValueCGPointType),
+            ("AXSize", ax::kAXValueCGSizeType),
+        ]) {
+            if !bound(&window) {
+                return CaptureAttempt::Unanswered;
+            }
+            *slot = match unsafe { ax::copy_geometry_attr_checked(window.0, attribute, kind) } {
+                Ok(value) => value,
+                Err(ax::kAXErrorCannotComplete) => return CaptureAttempt::Unanswered,
+                Err(error) => {
+                    return CaptureAttempt::Failed(anyhow::anyhow!(
+                        "native window-aware activation bounds are unavailable: {error}"
+                    ))
+                }
+            };
+        }
+        let [[x, y], [width, height]] = frame;
+        if width < 1.0 || height < 1.0 {
+            return CaptureAttempt::Failed(anyhow::anyhow!(
+                "native window-aware activation bounds are unavailable"
+            ));
+        }
+        return CaptureAttempt::Found(Some(WindowActivation {
             window_id,
-            bounds: CGRect::new(
-                &CGPoint::new(bounds[0], bounds[1]),
-                &CGSize::new(bounds[2], bounds[3]),
-            ),
+            bounds: CGRect::new(&CGPoint::new(x, y), &CGSize::new(width, height)),
             activation_point: CGPoint::new(point[0], point[1]),
-        });
-        break;
+        }));
     }
-    ensure!(
-        alive(host),
-        "native activation host changed during AX capture"
-    );
-    match found {
-        Some(found) => Ok(Some(found)),
-        None if read_failed => bail!("native activation window list read failed"),
-        None => bail!("native activation window was not found"),
+    if unanswered {
+        return CaptureAttempt::Unanswered;
+    }
+    unlisted(list_error)
+}
+
+/// The requested window was not in the list: absent, a busy app (the read
+/// timed out, so another read may answer), or a read that failed outright.
+fn unlisted(list_error: Option<ax::AXError>) -> CaptureAttempt {
+    match list_error {
+        None => CaptureAttempt::Absent,
+        Some(ax::kAXErrorCannotComplete) => CaptureAttempt::Unanswered,
+        Some(error) => CaptureAttempt::Failed(anyhow::anyhow!(
+            "native activation window list read failed: AX error {error}"
+        )),
     }
 }
 
@@ -1024,6 +1126,148 @@ mod tests {
                 } else {
                     vec!["enforce", "field", "recover"]
                 },
+            );
+        }
+    }
+
+    fn activation() -> WindowActivation {
+        WindowActivation {
+            window_id: 7,
+            bounds: CGRect::new(&CGPoint::new(0.0, 0.0), &CGSize::new(100.0, 100.0)),
+            activation_point: CGPoint::new(50.0, 10.0),
+        }
+    }
+
+    #[test]
+    fn a_busy_app_that_answers_within_the_budget_is_captured() {
+        // Finder right after a navigation: the first window list read times out,
+        // the next one answers. Base failed the key input at the first read.
+        let mut calls = 0;
+        let found = capture_within(Duration::from_millis(250), 42, |_| {
+            calls += 1;
+            if calls < 3 {
+                CaptureAttempt::Unanswered
+            } else {
+                CaptureAttempt::Found(Some(activation()))
+            }
+        })
+        .unwrap();
+        assert_eq!(found.map(|found| found.window_id), Some(7));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn an_app_that_never_answers_fails_inside_the_bound_and_says_a_background_retry_is_safe() {
+        let limit = Duration::from_millis(60);
+        let started = Instant::now();
+        let mut handed = Vec::new();
+        let error = capture_within(limit, 42, |timeout| {
+            handed.push((started.elapsed(), timeout));
+            std::thread::sleep(timeout.min(Duration::from_millis(5)));
+            CaptureAttempt::Unanswered
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            started.elapsed() < limit + Duration::from_millis(40),
+            "{:?}",
+            started.elapsed()
+        );
+        for (at, timeout) in &handed {
+            assert!(
+                *at + *timeout <= limit + Duration::from_millis(2),
+                "{at:?} + {timeout:?}"
+            );
+        }
+        assert!(
+            error.starts_with("native activation window list read failed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("was not sent and the front app did not change"),
+            "{error}"
+        );
+        assert!(
+            error.contains("send the same call again in the background"),
+            "{error}"
+        );
+        assert!(
+            error.contains("foreground delivery is not needed"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_missing_window_or_a_hard_read_error_fails_at_once() {
+        let mut calls = 0;
+        let error = capture_within(Duration::from_millis(250), 42, |_| {
+            calls += 1;
+            CaptureAttempt::Absent
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "native activation window was not found");
+        assert_eq!(calls, 1);
+        let mut calls = 0;
+        let error = capture_within(Duration::from_millis(250), 42, |_| {
+            calls += 1;
+            CaptureAttempt::Failed(anyhow::anyhow!(
+                "native AXActivationPoint read failed: -25200"
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "native AXActivationPoint read failed: -25200"
+        );
+        assert_eq!(calls, 1);
+        let found = capture_within(Duration::from_millis(250), 42, |_| {
+            CaptureAttempt::Found(None)
+        });
+        assert!(
+            found.unwrap().is_none(),
+            "no activation point keeps the plain activation"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_settles_past_the_bound_is_not_used() {
+        // The activation point read answered "unsupported" (or the window was
+        // found) only after the bound: no activation is posted from it.
+        for late in [None, Some(activation())] {
+            let mut calls = 0;
+            let error = capture_within(Duration::from_millis(30), 42, |timeout| {
+                calls += 1;
+                std::thread::sleep(timeout + Duration::from_millis(5));
+                CaptureAttempt::Found(late)
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("send the same call again in the background"),
+                "{error}"
+            );
+            assert_eq!(calls, 1, "no read starts once the bound is spent");
+        }
+    }
+
+    #[test]
+    fn only_a_timed_out_window_list_read_is_read_again() {
+        assert!(matches!(unlisted(None), CaptureAttempt::Absent));
+        assert!(matches!(
+            unlisted(Some(ax::kAXErrorCannotComplete)),
+            CaptureAttempt::Unanswered
+        ));
+        for error in [
+            ax::kAXErrorAPIDisabled,
+            ax::kAXErrorInvalidUIElement,
+            ax::kAXErrorFailure,
+        ] {
+            let CaptureAttempt::Failed(failed) = unlisted(Some(error)) else {
+                panic!("error {error} must fail at once");
+            };
+            assert_eq!(
+                failed.to_string(),
+                format!("native activation window list read failed: AX error {error}")
             );
         }
     }
