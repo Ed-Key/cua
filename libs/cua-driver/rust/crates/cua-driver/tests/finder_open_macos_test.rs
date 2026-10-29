@@ -229,6 +229,15 @@ fn double_click_behind_another_app_opens_only_the_item_when_two_are_selected() {
         serde_json::json!({"pid": pid, "window_id": window_id, "element_token": token}),
     );
     assert!(!result.is_error(), "opening Inner from behind failed: {}", result.text());
+    assert!(
+        result.text().contains("from behind")
+            && result.text().contains("cmd+o")
+            && result.text().contains("the app was not brought to the front")
+            && !result.text().contains("AXOpen performed"),
+        "the two-selected open did not run Cmd+O from behind: {}",
+        result.text()
+    );
+    assert_eq!(front_app_name(), "Calculator", "the open brought another app to the front");
     let deadline = Instant::now() + Duration::from_secs(3);
     while window_title(&mut driver, window_id).as_deref() != Some("Inner") {
         assert!(Instant::now() < deadline, "the Finder window did not navigate into Inner");
