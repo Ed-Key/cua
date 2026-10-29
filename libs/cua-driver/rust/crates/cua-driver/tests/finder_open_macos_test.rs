@@ -219,9 +219,23 @@ fn double_click_behind_another_app_opens_only_the_item_when_two_are_selected() {
         assert!(Instant::now() < deadline, "Calculator did not come to the front");
         std::thread::sleep(Duration::from_millis(200));
     }
-    let all = driver.call("hotkey", serde_json::json!({"pid": pid, "window_id": window_id, "keys": ["cmd", "a"]}));
-    assert!(!all.is_error(), "select all failed: {}", all.text());
-    std::thread::sleep(Duration::from_millis(500));
+    // Both icons selected, as Finder reports it (the hotkey's Outcome line
+    // reads the icon view's selection): otherwise this would test an open
+    // from an empty selection.
+    let mut selected_both = false;
+    for _ in 0..3 {
+        let all = driver.call("hotkey", serde_json::json!({"pid": pid, "window_id": window_id, "keys": ["cmd", "a"]}));
+        assert!(!all.is_error(), "select all failed: {}", all.text());
+        let text = all.text();
+        if let Some(line) = text.lines().find(|line| line.contains("selected in icon view")) {
+            if line.contains("Inner") && line.contains("Other") {
+                selected_both = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(selected_both, "Finder did not report Inner and Other both selected after Cmd+A");
     let token = inner_icon_token(&mut driver, pid, window_id);
 
     let result = driver.call(
