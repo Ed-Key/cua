@@ -1556,19 +1556,32 @@ fn ax_windows_read_failed(error: AXError) -> bool {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows_reporting(element: AXUIElementRef) -> (Vec<AXUIElementRef>, bool) {
+    let (windows, error) = copy_ax_windows_with_error(element);
+    (windows, error.is_some())
+}
+
+/// [`copy_ax_windows_reporting`], with the AX error of a failed read
+/// (`kAXErrorFailure` when the value is missing or not an array).
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_ax_windows_with_error(
+    element: AXUIElementRef,
+) -> (Vec<AXUIElementRef>, Option<AXError>) {
     let attr = CFStr::new("AXWindows");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err != kAXErrorSuccess {
-        return (vec![], ax_windows_read_failed(err));
+        return (vec![], Some(err).filter(|err| ax_windows_read_failed(*err)));
     }
     if value.is_null() {
-        return (vec![], true);
+        return (vec![], Some(kAXErrorFailure));
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return (vec![], true);
+        return (vec![], Some(kAXErrorFailure));
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
@@ -1583,7 +1596,7 @@ pub unsafe fn copy_ax_windows_reporting(element: AXUIElementRef) -> (Vec<AXUIEle
             }
         })
         .collect();
-    (windows, false)
+    (windows, None)
 }
 
 /// Copy an attribute without conflating an AX failure with an absent value.
@@ -1904,7 +1917,23 @@ pub unsafe fn copy_ax_windows_including_reporting(
     pid: i32,
     window_id: u32,
 ) -> (Vec<AXUIElementRef>, bool) {
-    let (mut windows, read_failed) = copy_ax_windows_reporting(app);
+    let (windows, error) = copy_ax_windows_including_with_error(app, pid, window_id);
+    (windows, error.is_some())
+}
+
+/// [`copy_ax_windows_including_reporting`], with the AX error of a failed
+/// `AXWindows` read.
+///
+/// # Safety
+///
+/// `app` must be the valid application element of `pid`, and the caller must
+/// release every returned element.
+pub unsafe fn copy_ax_windows_including_with_error(
+    app: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+) -> (Vec<AXUIElementRef>, Option<AXError>) {
+    let (mut windows, error) = copy_ax_windows_with_error(app);
     let listed = windows
         .iter()
         .any(|&window| ax_get_window_id(window) == Some(window_id));
@@ -1913,7 +1942,7 @@ pub unsafe fn copy_ax_windows_including_reporting(
     }) {
         windows.extend(copy_ax_window_by_remote_token(pid, window_id));
     }
-    (windows, read_failed)
+    (windows, error)
 }
 
 #[cfg(test)]
