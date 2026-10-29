@@ -1426,7 +1426,7 @@ impl Tool for InvokeMenuTool {
             // route may change the front (the foreground route activates, the
             // background one restores), and the turn is held through the
             // hand-back.
-            let _turn = crate::input::mouse::foreground_turn()
+            let _turn = crate::input::mouse::turn_without_user_wait()
                 .map_err(|busy| format!("invoke_menu: {busy}"))?;
             // apps::frontmost_pid reads WindowServer first, so it is live here.
             let prior_frontmost = crate::apps::frontmost_pid();
@@ -1449,6 +1449,10 @@ impl Tool for InvokeMenuTool {
                     Err(why) => why_foreground = Some(why),
                 }
             }
+            // The foreground route brings the target forward: it waits while
+            // the user is typing, as every foreground action does.
+            crate::input::user_activity::wait_until_user_idle()
+                .map_err(|busy| format!("invoke_menu: {busy}"))?;
             let prior_frontmost_window =
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
             let hidden_before = app_hidden(pid) == Some(true);

@@ -516,6 +516,7 @@ impl NativeInputState {
 
     fn post_keyboard(&self, event: &CGEvent) {
         if self.is_foreground() {
+            crate::input::user_activity::note_own_key_post(event);
             event.post(CGEventTapLocation::HID);
         } else {
             super::keyboard::post_keyboard_event(self.config.pid, event);

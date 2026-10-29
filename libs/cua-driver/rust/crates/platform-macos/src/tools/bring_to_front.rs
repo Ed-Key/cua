@@ -517,6 +517,7 @@ fn admit(pid: i32, window_id: Option<u32>) -> Result<crate::input::mouse::Foregr
         let code = match busy {
             ForegroundBusy::ClickHeld { .. } => "bring_to_front_click_in_flight",
             ForegroundBusy::EarlierAction { .. } => "bring_to_front_foreground_busy",
+            ForegroundBusy::UserActive { .. } => "user_active",
         };
         ToolResult::error(format!("bring_to_front: {busy}."))
             .with_structured(json!({

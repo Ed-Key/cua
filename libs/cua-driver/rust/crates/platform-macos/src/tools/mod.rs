@@ -550,8 +550,19 @@ pub(crate) async fn focus_by_pixel(
         .invoke(click_args)
         .await;
     if focus.is_error == Some(true) {
+        // The click's own reason (a user_active refusal names the background
+        // route) is what the caller needs, not just that it failed.
+        let reason = focus
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         return Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
+            "focus pixel-click at ({x:.0},{y:.0}) failed: {reason}"
         )));
     }
     // Brief settle so the renderer registers focus before the keystrokes.

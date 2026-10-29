@@ -338,6 +338,7 @@ pub(crate) enum KeyRole {
 /// is posted as is.
 pub(crate) fn post_hid_key(event: &CGEvent, role: KeyRole) -> anyhow::Result<()> {
     let Some(recipient) = CURRENT.with(|c| c.borrow().clone()) else {
+        super::user_activity::note_own_key_post(event);
         event.post(CGEventTapLocation::HID);
         return Ok(());
     };
@@ -401,6 +402,7 @@ impl Recipient {
             }
         }
         ledger.posted.fetch_add(1, Ordering::SeqCst);
+        super::user_activity::note_own_key_post(event);
         event.post(CGEventTapLocation::HID);
         Ok(())
     }
