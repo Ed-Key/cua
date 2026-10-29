@@ -59,6 +59,45 @@ fn item_name(element: AXUIElementRef) -> Option<String> {
 
 const NOT_ALONE: &str = "the item could not be read back as Finder's only selection after the click, so File > Open could open something else";
 
+/// How long one AX selection write gets to read back as the only selection.
+const AX_SELECT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Make the item Finder's only selection with one AX write, without the
+/// click tool's pointer ladder (which first waits 1 s on an AXSelected write
+/// Finder's icon view ignores, item 43 timing): the list's
+/// AXSelectedChildren (icon view), else its AXSelectedRows or the row's
+/// AXSelected (list view). `true` once an exclusive read-back proves it (or
+/// it already was); `false` sends the click tool's ladder as before.
+fn select_alone_by_ax(element_ptr: usize) -> bool {
+    let Some(row) = crate::input::ax_actions::RowSelection::capture(element_ptr) else {
+        return false;
+    };
+    let alone = || row.observe().is_some_and(|readback| readback.exclusive());
+    if alone() {
+        return true;
+    }
+    let proven = || {
+        let deadline = std::time::Instant::now() + AX_SELECT_WAIT;
+        loop {
+            if alone() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
+    if row
+        .select_via_selected_children()
+        .is_some_and(|error| error == kAXErrorSuccess)
+        && proven()
+    {
+        return true;
+    }
+    row.select_via_ax() == kAXErrorSuccess && proven()
+}
+
 /// The refusal for an element that names another item than it did.
 fn renamed(idx: usize, asked: &str, now: Option<String>) -> NotFromBehind {
     NotFromBehind::Refuse(format!(
@@ -217,7 +256,17 @@ impl DoubleClickTool {
             (named, alone)
         };
         crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async move {
-            let selected = click.invoke(click_args).await;
+            let select_guard = element_guard.clone();
+            let by_ax = crate::background_mutation::spawn_blocking(move || {
+                select_alone_by_ax(select_guard.as_ptr())
+            })
+            .await
+            .unwrap_or(false);
+            let selected = if by_ax {
+                ToolResult::text("selected through accessibility")
+            } else {
+                click.invoke(click_args).await
+            };
             let said = selected
                 .content
                 .iter()

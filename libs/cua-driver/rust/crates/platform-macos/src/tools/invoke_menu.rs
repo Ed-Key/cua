@@ -371,6 +371,7 @@ unsafe fn observe(
     window_id: u32,
     window: Option<AXUIElementRef>,
     item: AXUIElementRef,
+    light: bool,
 ) -> Observed {
     // Menus (layer 101 and up) and helper windows under 100 pt come and go
     // on their own (a Catalyst app's menu windows moved after an AX read of
@@ -392,14 +393,31 @@ unsafe fn observe(
     windows.sort_unstable();
     // The target window exists, so an empty list is a failed enumeration.
     let windows = (!windows.is_empty()).then_some(windows);
-    let facts = crate::outcome::command_facts(pid, window_id);
+    // Light (a keys-only press from behind, double_click's File > Open): the
+    // window's title stands in for what it shows; the full reads cost about
+    // 0.2 s each and the call's Outcome line reports the effect anyway.
+    let (facts, ui) = if light {
+        let title = window.and_then(|window| copy_string_attr(window, "AXTitle"));
+        let hash = title.map(|title| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            title.hash(&mut hasher);
+            hasher.finish()
+        });
+        (None, hash)
+    } else {
+        (
+            crate::outcome::command_facts(pid, window_id),
+            window.and_then(|window| crate::outcome::shown_signature(window)),
+        )
+    };
     Observed {
         // A Quit leaves every other read unknown; the process says it.
         alive: Some(libc::kill(pid, 0) == 0),
         clipboard: crate::outcome::pasteboard_change_count(),
         windows,
         facts,
-        ui: window.and_then(|window| crate::outcome::shown_signature(window)),
+        ui,
         item: item_state(item),
     }
 }
@@ -899,7 +917,7 @@ fn press_in_background(
                 }
             }
             let window = ax_window(pid, window_id);
-            let read = || observe(pid, window_id, window, item);
+            let read = || observe(pid, window_id, window, item, keys_only);
             let menus_before = crate::windows::menu_window_ids(pid).unwrap_or_default();
             let mark = crate::focus_steal::activation_mark();
             let lease =
