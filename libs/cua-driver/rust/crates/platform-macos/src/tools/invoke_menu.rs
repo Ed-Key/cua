@@ -371,6 +371,7 @@ unsafe fn observe(
     window_id: u32,
     window: Option<AXUIElementRef>,
     item: AXUIElementRef,
+    light: bool,
 ) -> Observed {
     // Menus (layer 101 and up) and helper windows under 100 pt come and go
     // on their own (a Catalyst app's menu windows moved after an AX read of
@@ -392,14 +393,31 @@ unsafe fn observe(
     windows.sort_unstable();
     // The target window exists, so an empty list is a failed enumeration.
     let windows = (!windows.is_empty()).then_some(windows);
-    let facts = crate::outcome::command_facts(pid, window_id);
+    // Light (a keys-only press from behind, double_click's File > Open): the
+    // window's title stands in for what it shows; the full reads cost about
+    // 0.2 s each and the call's Outcome line reports the effect anyway.
+    let (facts, ui) = if light {
+        let title = window.and_then(|window| copy_string_attr(window, "AXTitle"));
+        let hash = title.map(|title| {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            title.hash(&mut hasher);
+            hasher.finish()
+        });
+        (None, hash)
+    } else {
+        (
+            crate::outcome::command_facts(pid, window_id),
+            window.and_then(|window| crate::outcome::shown_signature(window)),
+        )
+    };
     Observed {
         // A Quit leaves every other read unknown; the process says it.
         alive: Some(libc::kill(pid, 0) == 0),
         clipboard: crate::outcome::pasteboard_change_count(),
         windows,
         facts,
-        ui: window.and_then(|window| crate::outcome::shown_signature(window)),
+        ui,
         item: item_state(item),
     }
 }
@@ -652,6 +670,14 @@ fn choose_press(
     }
 }
 
+/// The press for a caller that needs the item's key equivalent, whatever
+/// the item's enabled state reads (an AX press of an item that is disabled
+/// from behind does nothing and still reads as sent): its shortcut, or none.
+fn keys_press(keys: Option<(String, Vec<&'static str>)>) -> Result<Press, &'static str> {
+    keys.map(|(key, modifiers)| Press::Keys { key, modifiers })
+        .ok_or("the item has no key equivalent to send from behind")
+}
+
 /// How a press made from behind ended.
 #[derive(Debug, PartialEq)]
 enum Background {
@@ -835,7 +861,13 @@ const BACKGROUND_VERDICT_AFTER: Duration = Duration::from_millis(400);
 /// within [`BACKGROUND_EFFECT_WAIT`] showed changed against two steady reads
 /// before it (nothing, when the command shows its effect later or not at
 /// all: it is still pressed, and is not pressed again).
-fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) -> Background {
+fn press_in_background(
+    pid: i32,
+    window_id: u32,
+    path: &[String],
+    prior: i32,
+    keys_only: bool,
+) -> Background {
     if let Some(why) = front_route_for_inline_edit(
         crate::tools::edit_commit::app_saves_on_end_editing(pid),
         || item_opens_editor(pid, path),
@@ -849,17 +881,22 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
             Err(why) => return Background::skipped(why),
         };
         let outcome = (|| {
-            let press = choose_press(
-                copy_bool_attr(item, "AXEnabled"),
-                choose_action(&copy_action_names(item), true),
-                key_equivalent(
-                    crate::ax::bindings::copy_string_attr_checked(item, "AXMenuItemCmdChar")
-                        .ok()
-                        .as_deref(),
-                    shortcut_virtual_key(item),
-                    shortcut_modifiers(item),
-                ),
+            let keys = key_equivalent(
+                crate::ax::bindings::copy_string_attr_checked(item, "AXMenuItemCmdChar")
+                    .ok()
+                    .as_deref(),
+                shortcut_virtual_key(item),
+                shortcut_modifiers(item),
             );
+            let press = if keys_only {
+                keys_press(keys)
+            } else {
+                choose_press(
+                    copy_bool_attr(item, "AXEnabled"),
+                    choose_action(&copy_action_names(item), true),
+                    keys,
+                )
+            };
             let press = match press {
                 Ok(press) => press,
                 Err(why) => return Background::skipped(why),
@@ -880,7 +917,7 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                 }
             }
             let window = ax_window(pid, window_id);
-            let read = || observe(pid, window_id, window, item);
+            let read = || observe(pid, window_id, window, item, keys_only);
             let menus_before = crate::windows::menu_window_ids(pid).unwrap_or_default();
             let mark = crate::focus_steal::activation_mark();
             let lease =
@@ -1257,6 +1294,50 @@ fn after_background(outcome: Background, restore: impl FnOnce() -> bool) -> Resu
     }
 }
 
+/// What a press from behind only ends with: `Ok` with the call's words once
+/// the item was pressed (also when the press returned an error or nothing
+/// showed: the caller must not run the command another way), `Err` with why
+/// it was not pressed.
+fn behind_only(outcome: Background, restore: impl FnOnce() -> bool) -> Result<String, String> {
+    after_background(outcome, restore).map(|ran| summary(&ran))
+}
+
+/// Run the final item of `path` from behind and never in front, by its key
+/// equivalent only, for a tool that has a route of its own when this one
+/// cannot run (double_click opens a Finder item with File > Open). Holds the per-process lease (or reuses
+/// the caller's) and the foreground turn, as [`InvokeMenuTool`] does.
+pub(crate) async fn press_from_behind_only(
+    pid: i32,
+    window_id: u32,
+    path: Vec<String>,
+    // Run once the foreground turn is held, before anything is sent; `Err`
+    // stops the press with that reason.
+    ready: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> Result<String, String> {
+    let mutation = if crate::background_mutation::held_by_current_task(pid) {
+        None
+    } else {
+        Some(crate::background_mutation::acquire(pid).await)
+    };
+    // The worker keeps the lease (its own, or the caller's it reuses) when
+    // the call is cancelled: background_mutation::spawn_blocking carries it.
+    crate::background_mutation::spawn_blocking(move || {
+        let _mutation = mutation;
+        let _turn = crate::input::mouse::foreground_turn().map_err(|busy| busy.to_string())?;
+        let prior = crate::apps::frontmost_pid()
+            .filter(|prior| *prior != pid)
+            .ok_or_else(|| "the app is in front (or no other app is)".to_owned())?;
+        ready()?;
+        let restore = || {
+            crate::apps::confirm_front(prior)
+                || (crate::apps::restore_prior_app(prior) && crate::apps::confirm_front(prior))
+        };
+        behind_only(press_in_background(pid, window_id, &path, prior, true), restore)
+    })
+    .await
+    .unwrap_or_else(|error| Err(format!("the press from behind did not run ({error})")))
+}
+
 fn summary(ran: &Ran) -> String {
     match ran {
         Ran::Background {
@@ -1444,7 +1525,7 @@ impl Tool for InvokeMenuTool {
                         || (crate::apps::restore_prior_app(prior)
                             && crate::apps::confirm_front(prior))
                 };
-                match after_background(press_in_background(pid, window_id, &path, prior), restore) {
+                match after_background(press_in_background(pid, window_id, &path, prior, false), restore) {
                     Ok(ran) => return Ok(ran),
                     Err(why) => why_foreground = Some(why),
                 }
@@ -2081,6 +2162,34 @@ mod tests {
         assert!(
             text.contains("AX error -25204") && text.contains("the app's windows changed"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_keys_only_press_is_the_shortcut_whatever_the_item_reads() {
+        // An item that reads enabled (or unreadable) with AXPress would get an
+        // AX press from choose_press; keys only takes its shortcut instead.
+        let cmd_o = || Some(("o".to_owned(), vec!["cmd"]));
+        assert_eq!(choose_press(Some(true), Some("AXPress"), cmd_o()), Ok(Press::Ax("AXPress")));
+        assert_eq!(choose_press(None, Some("AXPress"), cmd_o()), Ok(Press::Ax("AXPress")));
+        assert_eq!(keys_press(cmd_o()), Ok(Press::Keys { key: "o".into(), modifiers: vec!["cmd"] }));
+        assert!(keys_press(None).is_err());
+    }
+
+    #[test]
+    fn a_press_from_behind_only_counts_once_sent_whatever_it_showed() {
+        let keys = || Press::Keys { key: "o".into(), modifiers: vec!["cmd"] };
+        for outcome in [
+            pressed(vec![], false, None),
+            pressed(vec![], false, Some("AX error -25200")),
+            Background::Pressed { press: keys(), changed: vec![], lasted: false, activated: false, error: None },
+            Background::Pressed { press: keys(), changed: vec!["the app's windows"], lasted: true, activated: true, error: None },
+        ] {
+            assert!(behind_only(outcome, || true).is_ok(), "a sent press must end the call");
+        }
+        assert_eq!(
+            behind_only(Background::skipped("the app has an inline edit open"), || true),
+            Err("the app has an inline edit open".to_owned())
         );
     }
 

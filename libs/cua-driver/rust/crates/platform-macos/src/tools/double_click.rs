@@ -26,9 +26,414 @@ fn background_action_for_element(
     }
 }
 
+/// Whether a background double_click opens this element from behind with
+/// Finder's File > Open instead of AXOpen: an item of Finder's file view (its
+/// icon, or its name in list and column view) while another app is in front.
+/// AXOpen raises Finder's window above the user's app in the bench image
+/// (item 43). Finder's sidebar cells advertise AXOpen too; they and any other
+/// role keep AXOpen.
+// ponytail: role allowlist from the bench image's icon, list and column views
+// (gallery and desktop items are AXImage too); an unknown role keeps AXOpen.
+fn opens_from_behind(
+    foreground: bool,
+    has_ax_open: bool,
+    finder: bool,
+    role: &str,
+    other_app_in_front: bool,
+) -> bool {
+    !foreground
+        && has_ax_open
+        && finder
+        && other_app_in_front
+        && matches!(role, "AXImage" | "AXTextField")
+}
+
+/// The name a Finder item shows (an icon's title, a name field's value), so
+/// the item opened is proven to be the one asked for; `None` when it has none.
+fn item_name(element: AXUIElementRef) -> Option<String> {
+    ["AXTitle", "AXValue", "AXDescription"]
+        .into_iter()
+        .filter_map(|attribute| unsafe { crate::ax::bindings::copy_string_attr(element, attribute) })
+        .find(|name| !name.trim().is_empty())
+}
+
+const NOT_ALONE: &str = "the item could not be read back as Finder's only selection after the click, so File > Open could open something else";
+
+/// How long one AX selection write gets to read back as the only selection
+/// (AppKit applies the write before it returns; this covers the read-back).
+const AX_SELECT_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Make the item Finder's only selection with one AX write, without the
+/// click tool's ladder (its first rung waits 1 s on an AXSelected write that
+/// Finder's icon view ignores, and its pointer rung settles 0.6 s more; item
+/// 43 timing, research/2026-10-28-item-43). Finder's icon view takes
+/// AXSelectedChildren on its outer list, naming the item's cell (the icon's
+/// parent group); list view takes AXSelectedRows on its outline. `true` once
+/// an exclusive read-back proves it (or it already was); `false` sends the
+/// click tool's ladder as before.
+fn select_alone_by_ax(element_ptr: usize) -> bool {
+    let Some(row) = crate::input::ax_actions::RowSelection::capture(element_ptr) else {
+        return false;
+    };
+    let alone = || only_selection(element_ptr);
+    if alone() {
+        return true;
+    }
+    let proven = || {
+        let deadline = std::time::Instant::now() + AX_SELECT_WAIT;
+        loop {
+            if alone() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
+    let by_children = unsafe { select_through_selected_children(element_ptr as AXUIElementRef, &proven) };
+    by_children
+        || (row.kind == crate::input::ax_actions::RowKind::Native
+            && row.select_via_ax() == kAXErrorSuccess
+            && proven())
+}
+
+/// The nearest of the item's ancestors (up to 4) whose AXSelectedChildren is
+/// settable, given as its selection the item's parent cell, then the item
+/// itself, each proven before the next is tried.
+// ponytail: the cell-then-item order is Finder's icon view, as measured;
+// another layout costs one 150 ms miss before the click tool's ladder.
+unsafe fn select_through_selected_children(element: AXUIElementRef, proven: &dyn Fn() -> bool) -> bool {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    let mut owned = Vec::new();
+    let mut current = element;
+    let mut list = None;
+    for _ in 0..4 {
+        let Some(parent) = crate::ax::bindings::copy_element_attr(current, "AXParent") else {
+            break;
+        };
+        owned.push(parent);
+        if crate::ax::bindings::attribute_settable(parent, "AXSelectedChildren") == Some(true) {
+            list = Some(parent);
+            break;
+        }
+        current = parent;
+    }
+    let selected = list.is_some_and(|list| {
+        let cell = owned.first().copied().filter(|cell| Some(*cell) != Some(list));
+        cell.into_iter().chain([element]).any(|child| {
+            let value = core_foundation::array::CFArray::from_CFTypes(&[CFType::wrap_under_get_rule(
+                child as CFTypeRef,
+            )]);
+            let name = core_foundation::string::CFString::new("AXSelectedChildren");
+            crate::ax::bindings::AXUIElementSetAttributeValue(list, name.as_concrete_TypeRef(), value.as_CFTypeRef())
+                == kAXErrorSuccess
+                && proven()
+        })
+    });
+    for element in owned {
+        core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
+    }
+    selected
+}
+
+/// Whether the item is the only selection of the list that owns Finder's
+/// selection: the nearest ancestor (up to 5) that reports AXSelectedChildren
+/// must hold exactly one element, the item or one of its ancestors below
+/// that list (icon view selects the icon's cell). A RowSelection read-back
+/// alone scans only the icon's own cell there, which cannot see another
+/// selected icon. With no such ancestor, the RowSelection read-back decides
+/// (list view's AXSelectedRows). `false` when unreadable.
+fn only_selection(element_ptr: usize) -> bool {
+    use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
+    unsafe {
+        let element = element_ptr as AXUIElementRef;
+        let mut path = vec![element];
+        let mut owned = Vec::new();
+        let mut verdict = None;
+        let mut current = element;
+        for _ in 0..5 {
+            let Some(parent) = crate::ax::bindings::copy_element_attr(current, "AXParent") else {
+                break;
+            };
+            owned.push(parent);
+            match crate::ax::bindings::copy_element_array_attr_checked(parent, "AXSelectedChildren", 20_000) {
+                Ok(selected) => {
+                    let one = selected.len() == 1
+                        && path.iter().any(|on_path| CFEqual(selected[0] as CFTypeRef, *on_path as CFTypeRef) != 0);
+                    for child in selected {
+                        CFRelease(child as CFTypeRef);
+                    }
+                    verdict = Some(one);
+                    break;
+                }
+                Err(crate::ax::bindings::kAXErrorAttributeUnsupported | crate::ax::bindings::kAXErrorNoValue) => {}
+                Err(_) => {
+                    verdict = Some(false);
+                    break;
+                }
+            }
+            path.push(parent);
+            current = parent;
+        }
+        for parent in owned {
+            CFRelease(parent as CFTypeRef);
+        }
+        verdict.unwrap_or_else(|| {
+            crate::input::ax_actions::RowSelection::capture(element_ptr)
+                .and_then(|row| row.observe())
+                .is_some_and(|readback| readback.exclusive())
+        })
+    }
+}
+
+/// The refusal for an element that names another item than it did.
+fn renamed(idx: usize, asked: &str, now: Option<String>) -> NotFromBehind {
+    NotFromBehind::Refuse(format!(
+        "element [{idx}] named {asked:?} before the click and {} after it, so it was not opened; take a fresh snapshot",
+        now.map_or_else(|| "nothing readable".to_owned(), |now| format!("{now:?}"))
+    ))
+}
+
+/// Whether the nested click refused the element itself: it now names other
+/// content than its snapshot row, or its token is stale (a newer snapshot).
+fn token_refused(structured: Option<&Value>) -> bool {
+    structured.is_some_and(|structured| {
+        structured.get("code").and_then(Value::as_str) == Some("element_changed")
+            || structured.pointer("/refusal/code").and_then(Value::as_str)
+                == Some("stale_element_token")
+    })
+}
+
+/// The identity fields of an element as its snapshot row renders them
+/// (ax::tree::format_node_line): ` "title"`, ` = value`, ` [placeholder=..]`,
+/// ` (description)`, from live reads, with the walk's trimming rules.
+struct Identity {
+    title: Option<String>,
+    value: Option<String>,
+    placeholder: Option<String>,
+    description: Option<String>,
+}
+
+impl Identity {
+    fn read(element: AXUIElementRef, role: &str) -> Self {
+        let read = |attribute| unsafe { crate::ax::bindings::copy_string_attr(element, attribute) };
+        let trimmed = |text: Option<String>| text.map(|t| t.trim().to_owned()).filter(|t| !t.is_empty());
+        let value = unsafe { crate::ax::bindings::copy_stringish_attr(element, "AXValue") }
+            .and_then(|copied| copied.string_value)
+            .filter(|v| !v.trim().is_empty() || crate::ax::tree::is_text_entry_role(role));
+        Identity {
+            title: trimmed(read("AXTitle")),
+            value,
+            placeholder: read("AXPlaceholderValue").filter(|hint| !hint.trim().is_empty()),
+            description: trimmed(read("AXDescription")),
+        }
+    }
+
+    fn rendered(&self) -> String {
+        let mut out = String::new();
+        if let Some(t) = &self.title {
+            out.push_str(&format!(" \"{t}\""));
+        }
+        if let Some(v) = &self.value {
+            out.push_str(&format!(" = {}", serde_json::json!(v)));
+        }
+        if let Some(p) = &self.placeholder {
+            out.push_str(&format!(" [placeholder={}]", serde_json::json!(p)));
+        }
+        if let Some(d) = &self.description {
+            out.push_str(&format!(" ({d})"));
+        }
+        out
+    }
+}
+
+/// Whether a snapshot row (`- [idx] ROLE` and the identity fields, then the
+/// bracketed id, help, actions and state block) shows exactly these identity
+/// fields: the row is this prefix, then that block or nothing. No row known:
+/// nothing to compare against.
+fn row_shows(row: Option<&str>, idx: usize, role: &str, identity: &Identity) -> bool {
+    row.is_none_or(|row| {
+        let line = row.split('\u{1}').next().unwrap_or_default();
+        let prefix = format!("- [{idx}] {role}{}", identity.rendered());
+        line.strip_prefix(&prefix).is_some_and(|rest| {
+            rest.is_empty()
+                || [" [id=", " [help=", " [actions=", " [selected", " [focused", " [value="]
+                    .iter()
+                    .any(|block| rest.starts_with(block))
+        })
+    })
+}
+
+/// Why the open from behind did not run.
+enum NotFromBehind {
+    /// Nothing was opened: AXOpen runs, and the result says why.
+    AxOpen(String),
+    /// The element now names another item: neither route runs.
+    Refuse(String),
+}
+
+/// Finder's Open command, run from behind by its key equivalent Cmd+O.
+// ponytail: English menu titles; another language does not find the item and
+// keeps AXOpen (the result says why).
+const FINDER_OPEN: [&str; 2] = ["File", "Open"];
+
 impl DoubleClickTool {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
+    }
+
+    /// Open a Finder item from behind: select it through the click tool's own
+    /// element path, prove it is the only selection, then run File > Open
+    /// from behind (invoke_menu's route; never in front). One per-process
+    /// lease covers both, so no other input to Finder lands between them.
+    /// `Ok`: the open was sent (it is never sent again another way). `Err`:
+    /// why nothing was opened: AXOpen, or a refusal when the element now
+    /// names another item.
+    async fn open_finder_item_from_behind(
+        &self,
+        args: &Value,
+        pid: i32,
+        wid: u32,
+        idx: usize,
+        element_guard: crate::ax::snapshot::RetainedElement,
+        role: &str,
+        snapshot_row: Option<String>,
+        lease: &super::BackgroundMutationLease,
+    ) -> Result<String, NotFromBehind> {
+        use cua_driver_core::tool::Tool;
+        let mut click_args = args.clone();
+        if let Some(map) = click_args.as_object_mut() {
+            map.remove("delivery_mode");
+        }
+        let click = super::click::ClickTool::new(self.state.clone());
+        let name_guard = element_guard.clone();
+        let asked = crate::background_mutation::spawn_blocking(move || {
+            item_name(name_guard.as_ptr() as AXUIElementRef)
+        })
+        .await
+        .ok()
+        .flatten()
+        .ok_or_else(|| {
+            NotFromBehind::Refuse(format!(
+                "element [{idx}]'s name could not be read, so it could not be proven to be the item the snapshot showed. Nothing was sent. Take a fresh snapshot"
+            ))
+        })?;
+        // The name the snapshot showed for this element: a list that refreshed
+        // after the snapshot can have handed the element to another item.
+        let identity_guard = element_guard.clone();
+        let identity_role = role.to_owned();
+        let identity = crate::background_mutation::spawn_blocking(move || {
+            Identity::read(identity_guard.as_ptr() as AXUIElementRef, &identity_role)
+        })
+        .await
+        .ok();
+        if !identity.is_some_and(|identity| row_shows(snapshot_row.as_deref(), idx, role, &identity)) {
+            return Err(NotFromBehind::Refuse(format!(
+                "element [{idx}] now names {asked:?}, not what the snapshot showed; the app reused it for other content. Nothing was sent. Take a fresh snapshot"
+            )));
+        }
+        // Whether the element still names the asked item and is Finder's only
+        // selection: Cmd+O then opens exactly it. A list that refreshed can
+        // hand the element to another item.
+        let state = move |element: &crate::ax::snapshot::RetainedElement| {
+            let ptr = element.as_ptr();
+            let named = item_name(ptr as AXUIElementRef);
+            (named, only_selection(ptr))
+        };
+        // The token must still name the latest snapshot's element: a newer
+        // snapshot (another read while this call waited) makes it stale,
+        // which the click tool would refuse; the AX select must too.
+        if let Err(refused) = self.state.snapshots.resolve(pid, args) {
+            return Err(NotFromBehind::Refuse(
+                refused
+                    .content
+                    .iter()
+                    .find_map(|content| match content {
+                        cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "the element token no longer resolves".into()),
+            ));
+        }
+        crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async move {
+            let select_guard = element_guard.clone();
+            let by_ax = crate::background_mutation::spawn_blocking(move || {
+                select_alone_by_ax(select_guard.as_ptr())
+            })
+            .await
+            .unwrap_or(false);
+            let selected = if by_ax {
+                ToolResult::text("selected through accessibility")
+            } else {
+                click.invoke(click_args).await
+            };
+            let said = selected
+                .content
+                .iter()
+                .find_map(|content| match content {
+                    cua_driver_core::protocol::Content::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            // Every way out reads the element again: one that now names
+            // another item is neither opened by Cmd+O nor by AXOpen.
+            let read_guard = element_guard.clone();
+            let (now, alone) = crate::background_mutation::spawn_blocking(move || state(&read_guard))
+                .await
+                .unwrap_or((None, false));
+            if now.as_deref() != Some(asked.as_str()) {
+                return Err(renamed(idx, &asked, now));
+            }
+            // The click compares the element with the snapshot's row, and the
+            // token with the latest snapshot: an element the app reused for
+            // other content, or a token a newer snapshot replaced, is not
+            // opened either.
+            if token_refused(selected.structured_content.as_ref()) {
+                return Err(NotFromBehind::Refuse(said));
+            }
+            if selected.is_error == Some(true) {
+                return Err(NotFromBehind::AxOpen(format!(
+                    "selecting the item from behind failed ({said})"
+                )));
+            }
+            if !alone {
+                return Err(NotFromBehind::AxOpen(NOT_ALONE.into()));
+            }
+            // Read again once the foreground turn is held, right before the
+            // press: a foreground click (which takes no per-process lease) can
+            // change Finder's selection in between.
+            let path = FINDER_OPEN.iter().map(|segment| (*segment).to_owned()).collect();
+            let check_guard = element_guard.clone();
+            let check_asked = asked.clone();
+            let opened = super::invoke_menu::press_from_behind_only(pid, wid, path, move || {
+                match state(&check_guard) {
+                    (Some(named), true) if named == check_asked => Ok(()),
+                    (Some(named), _) if named != check_asked => {
+                        Err(format!("the element names {named:?} now"))
+                    }
+                    _ => Err(NOT_ALONE.into()),
+                }
+            })
+            .await;
+            match opened {
+                Ok(opened) => Ok(format!(
+                    "Opened element [{idx}] from behind: selected it (the only selection), then ran Finder's File > Open from behind instead of AXOpen, which raises Finder's window. {opened}"
+                )),
+                Err(why) => {
+                    let read_guard = element_guard.clone();
+                    let now = crate::background_mutation::spawn_blocking(move || state(&read_guard).0)
+                        .await
+                        .unwrap_or(None);
+                    if now.as_deref() != Some(asked.as_str()) {
+                        Err(renamed(idx, &asked, now))
+                    } else {
+                        Err(NotFromBehind::AxOpen(why))
+                    }
+                }
+            }
+        })
+        .await
     }
 }
 
@@ -90,6 +495,19 @@ impl Tool for DoubleClickTool {
             Ok(window_id) => window_id,
             Err(error) => return error,
         };
+        // The token's row as its snapshot showed it, read with the token: a
+        // newer snapshot later makes the token stale, which the nested click
+        // of the Finder route refuses.
+        let snapshot_row = match (element_index, window_id) {
+            (Some(idx), Some(wid)) => self
+                .state
+                .snapshots
+                .with_latest_payload(pid, u64::from(wid), |payload| {
+                    payload.rows.indexed.get(&idx).map(|(_, signature)| signature.clone())
+                })
+                .flatten(),
+            _ => None,
+        };
 
         // ── AX element path ──────────────────────────────────────────────────
         if let (Some(idx), Some(wid), Some(element_guard)) =
@@ -102,13 +520,15 @@ impl Tool for DoubleClickTool {
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
             let probe_guard = element_guard.clone();
-            let has_ax_open = tokio::task::spawn_blocking(move || unsafe {
-                copy_action_names(probe_guard.as_ptr() as AXUIElementRef)
-                    .iter()
-                    .any(|action| action == "AXOpen")
+            let (has_ax_open, role) = tokio::task::spawn_blocking(move || unsafe {
+                let element = probe_guard.as_ptr() as AXUIElementRef;
+                (
+                    copy_action_names(element).iter().any(|action| action == "AXOpen"),
+                    crate::ax::bindings::copy_string_attr(element, "AXRole").unwrap_or_default(),
+                )
             })
             .await
-            .unwrap_or(false);
+            .unwrap_or((false, String::new()));
             let _mutation_lease = if !delivery_mode.is_foreground() {
                 let action = background_action_for_element(has_ax_open);
                 match super::gate_background_window_action(pid, wid, Some(element_ptr), action)
@@ -121,6 +541,39 @@ impl Tool for DoubleClickTool {
                 None
             };
 
+            // A Finder item opens from behind (File > Open) where it can; AXOpen
+            // runs only when that route did not send anything, and says why.
+            let mut not_from_behind = None;
+            if let Some(lease) = _mutation_lease.as_ref().filter(|_| {
+                opens_from_behind(
+                    delivery_mode.is_foreground(),
+                    has_ax_open,
+                    crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder"),
+                    &role,
+                    crate::apps::frontmost_pid().is_some_and(|front| front != pid),
+                )
+            }) {
+                match self
+                    .open_finder_item_from_behind(
+                        &args,
+                        pid,
+                        wid,
+                        idx,
+                        element_guard.clone(),
+                        &role,
+                        snapshot_row.clone(),
+                        lease,
+                    )
+                    .await
+                {
+                    Ok(text) => return ToolResult::text(text),
+                    Err(NotFromBehind::Refuse(why)) => {
+                        return ToolResult::error(format!("double_click refused: {why}"))
+                    }
+                    Err(NotFromBehind::AxOpen(why)) => not_from_behind = Some(why),
+                }
+            }
+
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
@@ -128,12 +581,16 @@ impl Tool for DoubleClickTool {
             // AXPress: AXOpen on an Open/Save panel row activates the panel's
             // app (measured, and it fails there with -25205).
             let foreground = delivery_mode.is_foreground();
+            // The worker holds the lease too: a cancelled call must not free
+            // Finder for other input while the AXOpen still runs.
+            let worker_lease = _mutation_lease.clone();
             let result = crate::focus_guard::with_focus_suppressed(
                 (!foreground).then_some(pid),
                 crate::apps::frontmost_pid(),
                 "double_click.AXOpen",
                 || {
                     tokio::task::spawn_blocking(move || {
+                        let _lease = worker_lease;
                         ax_double_click(
                             pid,
                             wid,
@@ -149,7 +606,12 @@ impl Tool for DoubleClickTool {
             .await;
 
             return match result {
-                Ok(Ok(msg)) => ToolResult::text(msg),
+                Ok(Ok(msg)) => ToolResult::text(match not_from_behind {
+                    Some(why) => format!(
+                        "{msg} It was opened with AXOpen because the open from behind (select, then File > Open) could not run: {why}."
+                    ),
+                    None => msg,
+                }),
                 Ok(Err(e)) => ToolResult::error(format!("double_click failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -410,6 +872,58 @@ fn ax_double_click(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_snapshot_row_must_show_exactly_the_items_identity() {
+        let named = |title: &str, description: Option<&str>| Identity {
+            title: Some(title.into()),
+            value: None,
+            placeholder: None,
+            description: description.map(Into::into),
+        };
+        let icon = "- [50] AXImage \"Draft (Q3) Copy\" (Draft (Q3) Copy) [id=Draft (Q3) Copy actions=[open,show_menu]]\u{1}None";
+        assert!(row_shows(Some(icon), 50, "AXImage", &named("Draft (Q3) Copy", Some("Draft (Q3) Copy"))));
+        for part in ["Q3", "Draft", "Copy", "Draft (Q3)"] {
+            assert!(!row_shows(Some(icon), 50, "AXImage", &named(part, Some(part))), "{part} matched");
+        }
+        // Another index or role is another row.
+        assert!(!row_shows(Some(icon), 51, "AXImage", &named("Draft (Q3) Copy", Some("Draft (Q3) Copy"))));
+        // A title that holds a quote and a bracket does not match its first part.
+        let tricky = "- [5] AXImage \"Draft\" [old\" [actions=[open]]";
+        assert!(!row_shows(Some(tricky), 5, "AXImage", &named("Draft", None)));
+        assert!(row_shows(Some(tricky), 5, "AXImage", &named("Draft\" [old", None)));
+        let field = "- [74] AXTextField = \"Report \\\"Q3\\\".txt\" [actions=[open,show_menu,confirm] selected]";
+        let valued = |value: &str| Identity { title: None, value: Some(value.into()), placeholder: None, description: None };
+        assert!(row_shows(Some(field), 74, "AXTextField", &valued("Report \"Q3\".txt")));
+        assert!(!row_shows(Some(field), 74, "AXTextField", &valued("Q3")));
+        assert!(row_shows(None, 1, "AXImage", &valued("anything")));
+    }
+
+    #[test]
+    fn a_click_that_refused_the_element_itself_is_not_followed_by_axopen() {
+        assert!(token_refused(Some(&serde_json::json!({"code": "element_changed", "effect": "refused"}))));
+        assert!(token_refused(Some(&serde_json::json!({
+            "status": "refused", "refusal": {"code": "stale_element_token", "message": "stale"}
+        }))));
+        assert!(!token_refused(Some(&serde_json::json!({"code": "background_refused"}))));
+        assert!(!token_refused(None));
+    }
+
+    #[test]
+    fn a_finder_item_opens_from_behind_only_while_another_app_is_in_front() {
+        // icon view, list and column view names
+        assert!(opens_from_behind(false, true, true, "AXImage", true));
+        assert!(opens_from_behind(false, true, true, "AXTextField", true));
+        // Finder in front: nothing to raise above, AXOpen as before
+        assert!(!opens_from_behind(false, true, true, "AXImage", false));
+        // a sidebar cell, or any other role
+        assert!(!opens_from_behind(false, true, true, "AXCell", true));
+        assert!(!opens_from_behind(false, true, true, "AXRow", true));
+        // other apps, no AXOpen, the foreground rung
+        assert!(!opens_from_behind(false, true, false, "AXImage", true));
+        assert!(!opens_from_behind(false, false, true, "AXImage", true));
+        assert!(!opens_from_behind(true, true, true, "AXImage", true));
+    }
 
     #[test]
     fn background_element_route_does_not_guess_across_actuator_classes() {

@@ -94,6 +94,15 @@ pub(crate) fn held_by_current_task(pid: i32) -> bool {
         .unwrap_or(false)
 }
 
+/// The lease this task already holds for `pid` (inside [`with_held_lease`]),
+/// for a nested tool call to reuse: acquiring it again would wait on itself.
+pub(crate) fn held_guard(pid: i32) -> Option<Arc<OwnedMutexGuard<()>>> {
+    if !held_by_current_task(pid) {
+        return None;
+    }
+    HELD_GUARD.try_with(Arc::clone).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

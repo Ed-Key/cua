@@ -51,6 +51,8 @@ authorized_live_jev_use_demo_test::authorized_live_jev_no_matching_action_contro
 # every loop round; no canonical CI runner here provides that VM.
 finder_open_macos_test::double_click_on_a_finder_folder_opens_it_and_reports_success | Cua Lab VM suite: Finder AXOpen success on a disposable macOS VM
 finder_open_macos_test::click_open_on_a_finder_folder_opens_it_and_reports_success | Cua Lab VM suite: Finder AXOpen success on a disposable macOS VM
+finder_open_macos_test::double_click_on_a_finder_folder_behind_another_app_opens_it_from_behind | Cua Lab VM suite: Finder open from behind (File > Open by Cmd+O) on a disposable macOS VM
+finder_open_macos_test::double_click_behind_another_app_opens_only_the_item_when_two_are_selected | Cua Lab VM suite: Finder open from behind with two items selected on a disposable macOS VM
 finder_open_macos_test::foreground_click_reaches_a_finder_window_behind_another | Cua Lab VM suite: foreground click on a non-key Finder window on a disposable macOS VM
 child_window_macos_test::foreground_key_for_parent_reaches_focused_child_field | Cua Lab VM suite: AppKit child window focus on a disposable macOS VM
 child_window_macos_test::child_window_is_targetable_by_its_own_id | Cua Lab VM suite: AppKit child window targeting on a disposable macOS VM
