@@ -59,15 +59,18 @@ fn item_name(element: AXUIElementRef) -> Option<String> {
 
 const NOT_ALONE: &str = "the item could not be read back as Finder's only selection after the click, so File > Open could open something else";
 
-/// How long one AX selection write gets to read back as the only selection.
-const AX_SELECT_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+/// How long one AX selection write gets to read back as the only selection
+/// (AppKit applies the write before it returns; this covers the read-back).
+const AX_SELECT_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// Make the item Finder's only selection with one AX write, without the
-/// click tool's pointer ladder (which first waits 1 s on an AXSelected write
-/// Finder's icon view ignores, item 43 timing): the list's
-/// AXSelectedChildren (icon view), else its AXSelectedRows or the row's
-/// AXSelected (list view). `true` once an exclusive read-back proves it (or
-/// it already was); `false` sends the click tool's ladder as before.
+/// click tool's ladder (its first rung waits 1 s on an AXSelected write that
+/// Finder's icon view ignores, and its pointer rung settles 0.6 s more; item
+/// 43 timing, research/2026-10-28-item-43). Finder's icon view takes
+/// AXSelectedChildren on its outer list, naming the item's cell (the icon's
+/// parent group); list view takes AXSelectedRows on its outline. `true` once
+/// an exclusive read-back proves it (or it already was); `false` sends the
+/// click tool's ladder as before.
 fn select_alone_by_ax(element_ptr: usize) -> bool {
     let Some(row) = crate::input::ax_actions::RowSelection::capture(element_ptr) else {
         return false;
@@ -88,14 +91,50 @@ fn select_alone_by_ax(element_ptr: usize) -> bool {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
     };
-    if row
-        .select_via_selected_children()
-        .is_some_and(|error| error == kAXErrorSuccess)
-        && proven()
-    {
-        return true;
+    let by_children = unsafe { select_through_selected_children(element_ptr as AXUIElementRef, &proven) };
+    by_children
+        || (row.kind == crate::input::ax_actions::RowKind::Native
+            && row.select_via_ax() == kAXErrorSuccess
+            && proven())
+}
+
+/// The nearest of the item's ancestors (up to 4) whose AXSelectedChildren is
+/// settable, given as its selection the item's parent cell, then the item
+/// itself, each proven before the next is tried.
+// ponytail: the cell-then-item order is Finder's icon view, as measured;
+// another layout costs one 150 ms miss before the click tool's ladder.
+unsafe fn select_through_selected_children(element: AXUIElementRef, proven: &dyn Fn() -> bool) -> bool {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    let mut owned = Vec::new();
+    let mut current = element;
+    let mut list = None;
+    for _ in 0..4 {
+        let Some(parent) = crate::ax::bindings::copy_element_attr(current, "AXParent") else {
+            break;
+        };
+        owned.push(parent);
+        if crate::ax::bindings::attribute_settable(parent, "AXSelectedChildren") == Some(true) {
+            list = Some(parent);
+            break;
+        }
+        current = parent;
     }
-    row.select_via_ax() == kAXErrorSuccess && proven()
+    let selected = list.is_some_and(|list| {
+        let cell = owned.first().copied().filter(|cell| Some(*cell) != Some(list));
+        cell.into_iter().chain([element]).any(|child| {
+            let value = core_foundation::array::CFArray::from_CFTypes(&[CFType::wrap_under_get_rule(
+                child as CFTypeRef,
+            )]);
+            let name = core_foundation::string::CFString::new("AXSelectedChildren");
+            crate::ax::bindings::AXUIElementSetAttributeValue(list, name.as_concrete_TypeRef(), value.as_CFTypeRef())
+                == kAXErrorSuccess
+                && proven()
+        })
+    });
+    for element in owned {
+        core_foundation::base::CFRelease(element as core_foundation::base::CFTypeRef);
+    }
+    selected
 }
 
 /// The refusal for an element that names another item than it did.

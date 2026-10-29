@@ -513,23 +513,6 @@ impl RowSelection {
         }
     }
 
-    /// Ask for this row as the only selection through its container's
-    /// AXSelectedChildren, when that is settable (Finder's icon view takes it
-    /// where it ignores an AXSelected write on the icon). `None`: not settable.
-    pub fn select_via_selected_children(&self) -> Option<AXError> {
-        unsafe {
-            let container = self.container?;
-            if attribute_settable(container, "AXSelectedChildren") != Some(true) {
-                return None;
-            }
-            let rows = core_foundation::array::CFArray::from_CFTypes(&[
-                core_foundation::base::CFType::wrap_under_get_rule(self.row as CFTypeRef),
-            ]);
-            let name = core_foundation::string::CFString::new("AXSelectedChildren");
-            Some(AXUIElementSetAttributeValue(container, name.as_concrete_TypeRef(), rows.as_CFTypeRef()))
-        }
-    }
-
     /// Ask for this row as the only selection with one AX write: the owning
     /// table's AXSelectedRows when it is settable, else the row's
     /// AXSelected. Returns the write's error (success is not proof it took).
