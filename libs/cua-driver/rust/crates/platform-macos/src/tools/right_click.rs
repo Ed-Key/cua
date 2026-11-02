@@ -236,7 +236,7 @@ impl Tool for RightClickTool {
                 if route == super::pixel_route::PixelClickRoute::ForegroundHid {
                     // Warp the hardware pointer and post at the HID tap; see
                     // `pixel_route` for the cross-platform foreground contract.
-                    return crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                    return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                         screen_x, screen_y, 1, "right", &m,
                     );
                 }

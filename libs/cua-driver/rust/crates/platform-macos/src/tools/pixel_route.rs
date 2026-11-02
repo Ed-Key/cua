@@ -22,7 +22,8 @@ use crate::input::pointer_toolkit::PointerReadingToolkit;
 pub(crate) enum PixelClickRoute {
     /// Explicit foreground rung with an exact window: activate that window,
     /// move the hardware pointer to the mapped global point, and post through
-    /// the global HID event tap. The pointer stays at the target.
+    /// the global HID event tap. On macOS the pointer returns after settling
+    /// unless the user moved it during the gesture.
     ForegroundHid,
     /// Background delivery routed to the target pid. The hardware pointer is
     /// never moved, so the result stays "not driver-verified".

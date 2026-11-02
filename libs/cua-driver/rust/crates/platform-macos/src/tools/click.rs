@@ -565,6 +565,9 @@ impl Tool for ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
+            let preserve_cursor =
+                super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref())
+                    .is_foreground();
             let result = crate::background_mutation::spawn_blocking(move || -> anyhow::Result<()> {
                 // Desktop scope is explicitly foreground and vision-driven: post
                 // at the global HID tap so WindowServer delivers to the window
@@ -572,6 +575,11 @@ impl Tool for ClickTool {
                 // turn the foreground contract back into background delivery.
                 let modifier_refs: Vec<&str> =
                     desktop_modifiers.iter().map(String::as_str).collect();
+                if preserve_cursor {
+                    return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                        sx, sy, count, &btn, &modifier_refs,
+                    );
+                }
                 crate::input::mouse::click_at_xy_desktop_with_modifiers(
                     sx,
                     sy,
@@ -1800,8 +1808,8 @@ impl Tool for ClickTool {
                                 // Warp the hardware pointer to the mapped global
                                 // point and post at the HID tap (or to the pid
                                 // around another process's active tap). The pointer
-                                // stays at the target, as on Windows and X11, so apps
-                                // that read the pointer when handling the event see it.
+                                // stays there through the gesture and its settle,
+                                // then returns unless the user moved it.
                                 return crate::input::mouse::foreground_click(
                                     pid,
                                     wid,

@@ -153,6 +153,9 @@ impl Tool for DragTool {
                 ClickButton::Right => DragButton::Right,
                 ClickButton::Middle => DragButton::Middle,
             };
+            let preserve_cursor =
+                super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref())
+                    .is_foreground();
             let cursor_for_drag = cursor_key.clone();
             crate::cursor::overlay::send_command(
                 cursor_key.clone(),
@@ -169,6 +172,7 @@ impl Tool for DragTool {
                     steps,
                     &modifier_refs,
                     button,
+                    preserve_cursor,
                     move |x, y| {
                         crate::cursor::overlay::send_command(
                             cursor_for_drag.clone(),

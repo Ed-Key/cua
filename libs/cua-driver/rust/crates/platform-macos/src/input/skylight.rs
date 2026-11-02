@@ -1571,6 +1571,7 @@ pub fn with_foreground_pointer_gesture<T>(
     // Before the PiP step-aside, so the whole gesture is one turn.
     let _turn = crate::input::mouse::foreground_turn()?;
     let aside = crate::pip::step_aside(path)?;
+    let _restore = crate::input::mouse::CursorRestore::begin(true);
     let result = with_foreground_hid_activation(target_pid, target_wid, || {
         ensure_topmost_at(target_pid, target_wid, point)?;
         action()
