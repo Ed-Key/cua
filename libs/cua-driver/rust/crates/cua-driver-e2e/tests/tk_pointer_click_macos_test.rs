@@ -30,13 +30,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cua_driver_testkit::{spawn_in_job, Driver, FixtureJournal, McpDriver};
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// Canvas size and the Send card center from the fixture's `CARDS` table.
 const CANVAS_WIDTH: f64 = 760.0;
 const CANVAS_HEIGHT: f64 = 460.0;
 const SEND_CENTER: (f64, f64) = (394.0, 221.0);
-const SEND_BOUNDS: (f64, f64, f64, f64) = (292.0, 132.0, 496.0, 310.0);
 
 fn fixture_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -151,21 +150,6 @@ fn send_screenshot_point(fixture: &mut TkFixture) -> (f64, f64) {
     (SEND_CENTER.0 * scale, title_bar + SEND_CENTER.1 * scale)
 }
 
-fn window_bounds(fixture: &mut TkFixture) -> Value {
-    let windows = fixture
-        .driver
-        .call("list_windows", json!({ "pid": fixture.pid }));
-    windows.structured()["windows"]
-        .as_array()
-        .and_then(|windows| {
-            windows
-                .iter()
-                .find(|window| window["window_id"].as_u64() == Some(fixture.window_id))
-        })
-        .map(|window| window["bounds"].clone())
-        .expect("fixture window bounds")
-}
-
 fn pointer(fixture: &mut TkFixture) -> (f64, f64) {
     let position = fixture.driver.call("get_cursor_position", json!({}));
     assert!(
@@ -181,11 +165,12 @@ fn pointer(fixture: &mut TkFixture) -> (f64, f64) {
 
 #[test]
 #[ignore]
-fn tk_window_pixel_click_foreground_moves_pointer_and_reaches_target() {
+fn tk_window_pixel_click_foreground_reaches_target_and_restores_pointer() {
     let Some(mut fixture) = launch("tk-pointer-foreground") else {
         return;
     };
     let (x, y) = send_screenshot_point(&mut fixture);
+    let before = pointer(&mut fixture);
     let click = fixture.driver.call(
         "click",
         json!({
@@ -221,20 +206,12 @@ fn tk_window_pixel_click_foreground_moves_pointer_and_reaches_target() {
         ),
     );
 
-    // The foreground contract leaves the hardware pointer at the target, like
-    // Windows SendInput and X11 XTest. Allow a small title-bar tolerance.
-    let bounds = window_bounds(&mut fixture);
+    // Tk reads the real pointer, so the click warps it to the target; once
+    // the click has passed, the pointer goes back where the user left it.
     let (px, py) = pointer(&mut fixture);
-    let left = bounds["x"].as_f64().unwrap();
-    let bottom = bounds["y"].as_f64().unwrap() + bounds["height"].as_f64().unwrap();
-    let canvas_top = bottom - CANVAS_HEIGHT;
-    let inside_send = px >= left + SEND_BOUNDS.0
-        && px <= left + SEND_BOUNDS.2
-        && py >= canvas_top + SEND_BOUNDS.1 - 4.0
-        && py <= canvas_top + SEND_BOUNDS.3 + 4.0;
     assert!(
-        inside_send,
-        "hardware pointer ({px},{py}) is not over the Send card; window bounds {bounds}"
+        (px - before.0).hypot(py - before.1) <= 3.0,
+        "hardware pointer ({px},{py}) did not return to {before:?}"
     );
 }
 

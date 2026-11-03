@@ -1,4 +1,5 @@
 {
+ "provenance": "Existing native snapshot with click descriptions updated from Rust source for the background modifier fix; cua-driver was not executed. Other entries are retained.",
  "tools": [
   {
    "description": "List macOS apps — both currently running and installed-but-not-running — with per-app state flags:\n\n- running: is a process for this app live? (pid is 0 when false)\n- active: is it the system-frontmost app? (implies running)\n- launch_path: filesystem path to the `.app` bundle, when known. Pass this to `launch_app` to start the app cold.\n- kind: `\"desktop\"` for `.app` bundles on macOS.\n- last_used: RFC3339 timestamp from the bundle's filesystem mtime, when readable; otherwise null.\n\nStandalone running entries include only apps with NSApplicationActivationPolicyRegular — background helpers and system UI agents are filtered out. Installed apps resolve their running/pid state against all live processes by bundle identifier, so an installed app whose process runs as an accessory (LSUIElement / menu-bar apps, e.g. Cua Driver itself) still reports its live pid. Installed apps come from scanning /Applications, /Applications/Utilities, ~/Applications, /System/Applications, and /System/Applications/Utilities.\n\nUse this for \"is X installed?\" as well as \"is X running?\". For per-window state — on-screen, on-current-Space, minimized, window titles — call list_windows instead. For just opening an app — running or not — call launch_app({bundle_id: ...}) directly; list_apps is not a prerequisite.",
@@ -501,7 +502,7 @@
    "read_only": false
   },
   {
-   "description": "Click a target pid. Prefer `element_token` (from get_window_state): it identifies one snapshot element, works on backgrounded, minimized or off-Space windows, and moves no cursor or focus. Use `x, y` only for canvas / video / WebGL / custom-drawn surfaces missing from the AX tree.\n\n- element_token: AX action path. Tokens are scoped to (pid, window_id) and stale once the window is snapshotted again.\n- x, y: window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events. Needs a visible window. `modifier` takes cmd/shift/option/ctrl.\n\n`button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open (holding key focus) until dismissed; to choose an option use `set_value`.",
+   "description": "Click an element or point. Prefer element_token from get_window_state; it works on background or hidden windows without moving the pointer. Use x,y in get_window_state screenshot pixels (include_screenshot:true) only for surfaces missing from the tree. To choose a pop-up option use set_value. Background modifier clicks use mouse-event flags at the element center or x,y and need a reachable window. Background by default. Details: skill://cua-driver/WORKFLOW.md",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -533,7 +534,7 @@
       "type": "string"
      },
      "delivery_mode": {
-      "description": "Default \"background\" (no fronting). \"foreground\" briefly fronts the window, acts, then restores the prior app; needs window_id and is required for modified clicks. Escalate in order: AX element_token, background pixel, foreground, checking state between rungs; a click has no read-back except list-row selection.",
+      "description": "Default \"background\" (no fronting). \"foreground\" briefly fronts the window, acts, then restores the prior app; needs window_id. Background modifier clicks post flagged mouse events to the target pid without moving the pointer or pressing physical keys; element clicks use their center. Escalate in order: AX element_token, background pixel, foreground, checking state between rungs; a click has no read-back except list-row selection.",
       "enum": [
        "background",
        "foreground"
@@ -550,7 +551,7 @@
       "type": "boolean"
      },
      "modifier": {
-      "description": "Modifier keys: cmd, shift, option/alt, ctrl.",
+      "description": "Modifier keys: cmd, shift, option/alt, ctrl. Background clicks carry flags on PID-routed mouse events without pressing physical keys. Element clicks use their center.",
       "items": {
        "type": "string"
       },

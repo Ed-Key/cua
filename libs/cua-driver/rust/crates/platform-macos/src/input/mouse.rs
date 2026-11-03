@@ -209,7 +209,7 @@ pub fn click_at_xy_desktop_with_modifiers(
 }
 
 /// Global HID modifier click that restores the user's hardware cursor after
-/// the event pair has been queued.
+/// the gesture and its settle, unless the user moved it.
 pub fn click_at_xy_desktop_with_modifiers_preserving_cursor(
     x: f64,
     y: f64,
@@ -218,6 +218,162 @@ pub fn click_at_xy_desktop_with_modifiers_preserving_cursor(
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
     click_at_xy_desktop_inner(x, y, count, button, modifiers, true).map(drop)
+}
+
+#[derive(Default)]
+struct CursorRestoreState {
+    prior: Option<CGPoint>,
+    last: Option<CGPoint>,
+    user_moved: bool,
+}
+
+fn cursor_still_at(current: CGPoint, last: CGPoint) -> bool {
+    (current.x - last.x).hypot(current.y - last.y) <= 3.0
+}
+
+impl CursorRestoreState {
+    fn moving_to(&mut self, current: CGPoint, next: CGPoint) {
+        if let Some(last) = self.last {
+            self.user_moved |= !cursor_still_at(current, last);
+        } else {
+            self.prior = Some(current);
+        }
+        self.last = Some(next);
+    }
+
+    /// A queued HID move: the hardware cursor reaches `next` only as the
+    /// window server drains the queue, so the current position proves nothing.
+    fn queued_to(&mut self, next: CGPoint) {
+        if self.prior.is_some() {
+            self.last = Some(next);
+        }
+    }
+
+    fn restore_to(&self, current: CGPoint) -> Option<CGPoint> {
+        self.last
+            .filter(|last| !self.user_moved && cursor_still_at(current, *last))
+            .and(self.prior)
+    }
+}
+
+thread_local! {
+    static CURSOR_RESTORE: std::cell::RefCell<Option<CursorRestoreState>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Nested pointer primitives share the outer gesture's restore, after its settle.
+pub(super) struct CursorRestore {
+    owner: bool,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+impl CursorRestore {
+    pub(super) fn begin(enabled: bool) -> Self {
+        let owner = CURSOR_RESTORE.with_borrow_mut(|state| {
+            if enabled && state.is_none() {
+                *state = Some(CursorRestoreState::default());
+                true
+            } else {
+                false
+            }
+        });
+        Self {
+            owner,
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
+}
+
+fn cursor_position() -> anyhow::Result<CGPoint> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    CGEvent::new(source)
+        .map(|event| event.location())
+        .map_err(|_| anyhow::anyhow!("CGEvent::new failed"))
+}
+
+fn track_cursor_move(point: CGPoint) -> anyhow::Result<()> {
+    CURSOR_RESTORE.with_borrow_mut(|state| {
+        if let Some(state) = state {
+            match cursor_position() {
+                Ok(current) => state.moving_to(current, point),
+                Err(error) if state.last.is_none() => return Err(error),
+                // A failed later sample must still let the button release post.
+                Err(_) => state.user_moved = true,
+            }
+        }
+        Ok(())
+    })
+}
+
+fn track_queued_cursor_move(point: CGPoint) {
+    CURSOR_RESTORE.with_borrow_mut(|state| {
+        if let Some(state) = state {
+            state.queued_to(point);
+        }
+    });
+}
+
+/// Waits for a HID gesture's button events to pass every session tap. One
+/// still held is noted unresolved, so the pointer restore and the front
+/// hand-back keep waiting for it, and is reported like a held click.
+fn settle_hid_gesture(baseline: ButtonCounters, backlog: [u32; 6], types: [CGEventType; 2]) -> anyhow::Result<()> {
+    if await_hid_passage(baseline, backlog, types, 1) != HidPassage::Pending {
+        return Ok(());
+    }
+    note_unresolved(baseline);
+    Err(ClickNotConfirmed { tap_owner: foreign_active_tap(event_mask(&types)), waited: HID_PASSAGE_TIMEOUT }.into())
+}
+
+impl Drop for CursorRestore {
+    fn drop(&mut self) {
+        if !self.owner {
+            return;
+        }
+        let Some(state) = CURSOR_RESTORE.with_borrow_mut(Option::take) else {
+            return;
+        };
+        if state.last.is_none() || state.user_moved {
+            return;
+        }
+        // Bounded: a button that stays down is the user's, and the pointer stays.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let Ok(current) = cursor_position() else {
+                return;
+            };
+            let Some(prior) = state.restore_to(current) else {
+                return;
+            };
+            // A delayed HID release must land before the pointer moves back.
+            if click_in_flight() || mouse_button_held() {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                continue;
+            }
+            let _ = core_graphics::display::CGDisplay::warp_mouse_cursor_position(prior);
+            unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+            return;
+        }
+    }
+}
+
+fn mouse_button_held() -> bool {
+    extern "C" {
+        fn CGEventSourceButtonState(state: CGEventSourceStateID, button: CGMouseButton) -> bool;
+    }
+    [
+        CGMouseButton::Left,
+        CGMouseButton::Right,
+        CGMouseButton::Center,
+    ]
+    .into_iter()
+    .any(|button| unsafe {
+        CGEventSourceButtonState(CGEventSourceStateID::CombinedSessionState, button)
+    })
 }
 
 /// Posts the click at the HID tap, then waits until the system has passed
@@ -237,17 +393,9 @@ fn click_at_xy_desktop_inner(
     // From the pointer warp to the passage verdict, no other worker's
     // foreground action may run (inside an activation helper, its turn).
     let _turn = hold_foreground_turn()?;
+    let _restore = CursorRestore::begin(preserve_cursor);
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let prior = if preserve_cursor {
-        Some(
-            CGEvent::new(source.clone())
-                .map_err(|_| anyhow::anyhow!("CGEvent::new failed"))?
-                .location(),
-        )
-    } else {
-        None
-    };
     let point = CGPoint::new(x, y);
     let (down_ty, up_ty, btn) = match button {
         "right" => (
@@ -266,14 +414,11 @@ fn click_at_xy_desktop_inner(
             CGMouseButton::Left,
         ),
     };
-    // Warp the REAL cursor to the point first (the macOS peer of Linux XTest's
-    // pointer warp). A synthetic MouseMoved event does not relocate the hardware
-    // cursor, and AppKit hit-tests some clicks against the actual cursor
-    // position, so without the warp the down/up can miss the target. Desktop
-    // scope is the foreground modality, so moving the visible cursor is expected.
+    // HID delivery needs the hardware pointer at the target, including for
+    // pointer-reading toolkits. Plain left clicks to other app windows use
+    // pid delivery without a warp, as native Computer Use does.
+    track_cursor_move(point)?;
     let _ = CGDisplay::warp_mouse_cursor_position(point);
-    // Re-couple cursor + mouse-delta so the synthesized click hit-tests at the
-    // warped point, not the pre-warp one.
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     std::thread::sleep(std::time::Duration::from_millis(40));
     let _dispatching = Dispatching::begin();
@@ -292,6 +437,7 @@ fn click_at_xy_desktop_inner(
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
+            track_cursor_move(point)?;
             crate::focus_steal::post_hid_mouse_event(&moved);
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
@@ -308,6 +454,7 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
+            track_cursor_move(point)?;
             crate::focus_steal::post_hid_mouse_event(&down);
             std::thread::sleep(std::time::Duration::from_millis(28));
             up.set_flags(flags);
@@ -315,6 +462,7 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
+            track_cursor_move(point)?;
             crate::focus_steal::post_hid_mouse_event(&up);
             posted_pairs.set(posted_pairs.get() + 1);
             if count > 1 {
@@ -333,10 +481,6 @@ fn click_at_xy_desktop_inner(
     // Let AppKit consume the up event before the pointer is restored. The
     // exact foreground guard remains active around this entire helper.
     std::thread::sleep(std::time::Duration::from_millis(40));
-    if let Some(prior) = prior {
-        let _ = CGDisplay::warp_mouse_cursor_position(prior);
-        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-    }
     match (passage, result) {
         (Some(HidPassage::Pending), _) => {
             note_unresolved(baseline);
@@ -815,17 +959,16 @@ pub fn foreign_active_tap(mask: u64) -> Option<i32> {
 pub enum ForegroundClick {
     /// At the HID tap, and the system passed it on past every session tap.
     Hid(HidPassage),
-    /// To the target pid with its window fields, because `tap_owner` holds an
-    /// active tap on left clicks that could drop or hold a HID click.
-    PidAroundTap { tap_owner: i32 },
+    /// To the target pid with its window fields, without moving the pointer.
+    /// `tap_owner`, when present, holds an active tap bypassed by this route.
+    Pid { tap_owner: Option<i32> },
 }
 
 /// The foreground click primitive, run inside the exact-window activation
 /// guard (`with_foreground_pointer_activation`), after the occlusion check.
-/// Decided before dispatch: a plain left click goes to the pid when another
-/// process holds an active tap on left clicks (native Computer Use always
-/// posts clicks to the pid); everything else is a HID click whose passage is
-/// confirmed ([`click_at_xy_desktop_inner`]).
+/// Plain left clicks go to the pid without moving the pointer, as native
+/// Computer Use does. Pointer-reading toolkits and other clicks use HID
+/// delivery whose passage is confirmed ([`click_at_xy_desktop_inner`]).
 #[allow(clippy::too_many_arguments)]
 pub fn foreground_click(
     pid: i32,
@@ -836,25 +979,39 @@ pub fn foreground_click(
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<ForegroundClick> {
-    if button == "left" && modifiers.is_empty() {
+    let _turn = hold_foreground_turn()?;
+    let toolkit = if button == "left" && modifiers.is_empty() {
+        super::pointer_toolkit::detect(pid)
+    } else {
+        None
+    };
+    if foreground_click_uses_pid(button, modifiers, toolkit) {
         let left = event_mask(&[CGEventType::LeftMouseDown, CGEventType::LeftMouseUp]);
-        if let Some(tap_owner) = foreign_active_tap(left) {
-            // The pointer goes to the target as on the HID route, so apps
-            // that read it see it there.
-            move_cursor_desktop(x, y)?;
-            click_at_xy_with_window_local(
-                pid, x, y, wx, wy, wid, count.max(1), &[], WindowClickDelivery::Foreground,
-            )?;
-            return Ok(ForegroundClick::PidAroundTap { tap_owner });
-        }
+        let tap_owner = foreign_active_tap(left);
+        let result = click_at_xy_with_window_local(
+            pid, x, y, wx, wy, wid, count.max(1), &[], WindowClickDelivery::Foreground,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        result?;
+        return Ok(ForegroundClick::Pid { tap_owner });
     }
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, false).map(ForegroundClick::Hid)
+    click_at_xy_desktop_inner(x, y, count, button, modifiers, true).map(ForegroundClick::Hid)
+}
+
+// Click count does not affect transport: single and double clicks share it.
+fn foreground_click_uses_pid(
+    button: &str,
+    modifiers: &[&str],
+    toolkit: Option<super::pointer_toolkit::PointerReadingToolkit>,
+) -> bool {
+    button == "left" && modifiers.is_empty() && toolkit.is_none()
 }
 
 /// Move the real hardware cursor to a logical desktop point.
 pub fn move_cursor_desktop(x: f64, y: f64) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
     let point = CGPoint::new(x, y);
+    track_cursor_move(point)?;
     CGDisplay::warp_mouse_cursor_position(point)
         .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
@@ -1003,6 +1160,19 @@ fn click_at_xy_inner(
             // Always stamp the requested flags: the HID-state source would
             // otherwise carry whatever modifiers the user physically holds.
             down.set_flags(flags);
+            let make_up = || {
+                CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseUp,
+                    point,
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))
+            };
+            // Foreground releases must exist before any button is pressed.
+            let prepared_up = (post_mode == MousePostMode::PublicOnly)
+                .then(make_up)
+                .transpose()?;
 
             post_mouse_event_with_mode(pid, &down, window_local, wid, click_state, 0, 3, post_mode);
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
@@ -1010,13 +1180,10 @@ fn click_at_xy_inner(
             // gap can race the loop's first poll and the click is dropped.
             std::thread::sleep(std::time::Duration::from_millis(28));
 
-            let up = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseUp,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
+            let up = match prepared_up {
+                Some(up) => up,
+                None => make_up()?,
+            };
             // Always stamp the requested flags: the HID-state source would
             // otherwise carry whatever modifiers the user physically holds.
             up.set_flags(flags);
@@ -1446,40 +1613,6 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn post_drag_mouse_event(
-    pid: i32,
-    event_type: CGEventType,
-    point: CGPoint,
-    button: CGMouseButton,
-    window_local: Option<(f64, f64)>,
-    wid: Option<u32>,
-    click_state: i64,
-    button_number: i64,
-    subtype: i64,
-    mode: MousePostMode,
-    flags: CGEventFlags,
-    error_context: &str,
-) -> anyhow::Result<()> {
-    debug_assert_eq!(mode, MousePostMode::HidOnly);
-    let event = new_global_mouse_event(event_type, point, button)
-        .map_err(|_| anyhow::anyhow!(error_context.to_owned()))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        event.set_flags(flags);
-    }
-    post_mouse_event_with_mode(
-        pid,
-        &event,
-        window_local,
-        wid,
-        click_state,
-        button_number,
-        subtype,
-        mode,
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn drag_at_xy_window_foreground_observed<F>(
     pid: i32,
     from_x: f64,
@@ -1499,6 +1632,8 @@ where
     F: FnMut(f64, f64),
 {
     use core_graphics::display::CGDisplay;
+    let _turn = hold_foreground_turn()?;
+    let _restore = CursorRestore::begin(true);
 
     let (cg_button, down_type, dragged_type, up_type, button_number) = match button {
         DragButton::Left => (
@@ -1529,22 +1664,29 @@ where
     } else {
         duration_ms
     };
-    let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
+    // Build the complete gesture before pressing, so allocation cannot strand a button.
+    let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps)
+        .into_iter()
+        .map(|spec| {
+            let (ty, button) = match spec.kind {
+                ForegroundDragEventKind::Move => (CGEventType::MouseMoved, CGMouseButton::Left),
+                ForegroundDragEventKind::Down => (down_type, cg_button),
+                ForegroundDragEventKind::Dragged => (dragged_type, cg_button),
+                ForegroundDragEventKind::Up => (up_type, cg_button),
+            };
+            let event = new_global_mouse_event(ty, spec.point, button)
+                .map_err(|_| anyhow::anyhow!("foreground drag event creation failed"))?;
+            Ok((spec, event))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
-    super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        // Where the button is held, between the press and the release: a
-        // failure there releases it before returning, never replaying input.
-        let mut held: Option<CGPoint> = None;
-        for spec in events {
-            let (event_type, click_state, event_button, event_button_number, subtype) = match spec
-                .kind
-            {
-                ForegroundDragEventKind::Move => {
-                    (CGEventType::MouseMoved, 0, CGMouseButton::Left, 0, 3)
-                }
-                ForegroundDragEventKind::Down => (down_type, 1, cg_button, button_number, 0),
-                ForegroundDragEventKind::Dragged => (dragged_type, 1, cg_button, button_number, 0),
-                ForegroundDragEventKind::Up => (up_type, 1, cg_button, button_number, 0),
+    let _dispatching = Dispatching::begin();
+    let (baseline, backlog) = hid_baseline();
+    let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
+        for (spec, event) in events {
+            let (click_state, event_button_number, subtype) = match spec.kind {
+                ForegroundDragEventKind::Move => (0, 0, 3),
+                _ => (1, button_number, 0),
             };
             let local = from_local.zip(to_local).map(|((fx, fy), (tx, ty))| {
                 (
@@ -1553,6 +1695,7 @@ where
                 )
             });
 
+            track_cursor_move(spec.point)?;
             match spec.kind {
                 ForegroundDragEventKind::Move => {
                     let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
@@ -1568,44 +1711,19 @@ where
                 ForegroundDragEventKind::Down => {}
             }
 
-            let posted = post_drag_mouse_event(
+            if flags != CGEventFlags::CGEventFlagNull {
+                event.set_flags(flags);
+            }
+            post_mouse_event_with_mode(
                 pid,
-                event_type,
-                spec.point,
-                event_button,
+                &event,
                 local,
                 wid,
                 click_state,
                 event_button_number,
                 subtype,
                 MousePostMode::HidOnly,
-                flags,
-                "foreground drag event creation failed",
             );
-            if let Err(error) = posted {
-                if let Some(at) = held {
-                    let _ = post_drag_mouse_event(
-                        pid,
-                        up_type,
-                        at,
-                        cg_button,
-                        None,
-                        wid,
-                        1,
-                        button_number,
-                        0,
-                        MousePostMode::HidOnly,
-                        flags,
-                        "foreground drag release failed",
-                    );
-                }
-                return Err(error);
-            }
-            held = match spec.kind {
-                ForegroundDragEventKind::Down | ForegroundDragEventKind::Dragged => Some(spec.point),
-                ForegroundDragEventKind::Up => None,
-                ForegroundDragEventKind::Move => held,
-            };
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
@@ -1625,10 +1743,11 @@ where
             }
         }
         Ok(())
-    })?;
+    });
 
+    let settled = settle_hid_gesture(baseline, backlog, [down_type, up_type]);
     std::thread::sleep(std::time::Duration::from_millis(100));
-    Ok(())
+    result.and(settled)
 }
 
 /// Foreground drag through the global HID event tap.
@@ -1658,6 +1777,7 @@ pub fn drag_at_xy_foreground(
         steps,
         modifiers,
         button,
+        false,
         |_, _| {},
     )
 }
@@ -1667,6 +1787,7 @@ pub fn drag_at_xy_foreground(
 /// The cursor overlay uses this to follow the same interpolated path and
 /// cadence as the HID gesture instead of gliding only after the real pointer
 /// has already completed the drag.
+/// `preserve_cursor` is enabled for explicitly foreground desktop calls.
 #[allow(clippy::too_many_arguments)]
 pub fn drag_at_xy_foreground_observed<F>(
     from_x: f64,
@@ -1677,6 +1798,7 @@ pub fn drag_at_xy_foreground_observed<F>(
     steps: usize,
     modifiers: &[&str],
     button: DragButton,
+    preserve_cursor: bool,
     mut observe: F,
 ) -> anyhow::Result<()>
 where
@@ -1685,6 +1807,7 @@ where
     use core_graphics::display::CGDisplay;
     // Global HID input: not under another worker's foreground action.
     let _turn = hold_foreground_turn()?;
+    let _restore = CursorRestore::begin(preserve_cursor);
 
     let (cg_button, down_type, dragged_type, up_type) = match button {
         DragButton::Left => (
@@ -1706,7 +1829,22 @@ where
             CGEventType::OtherMouseUp,
         ),
     };
-    let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
+    // The release exists before the press, even if a later event cannot be built.
+    let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps)
+        .into_iter()
+        .map(|spec| {
+            let ty = match spec.kind {
+                ForegroundDragEventKind::Move => CGEventType::MouseMoved,
+                ForegroundDragEventKind::Down => down_type,
+                ForegroundDragEventKind::Dragged => dragged_type,
+                ForegroundDragEventKind::Up => up_type,
+            };
+            let event = new_global_mouse_event(ty, spec.point, cg_button).map_err(|_| {
+                anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
+            })?;
+            Ok((spec, event))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let steps = steps.max(1);
     let step_delay_ms = if steps > 1 {
         duration_ms / steps as u64
@@ -1717,27 +1855,17 @@ where
     // Keep WindowServer's hardware cursor and event stream coupled. AppKit
     // hit-tests some pointer-capture surfaces against the actual cursor even
     // when the HID event carries an explicit location.
+    track_cursor_move(CGPoint::new(from_x, from_y))?;
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(from_x, from_y));
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     observe(from_x, from_y);
     std::thread::sleep(std::time::Duration::from_millis(40));
 
-    super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        for spec in events {
-            let event_type = match spec.kind {
-                ForegroundDragEventKind::Move => CGEventType::MouseMoved,
-                ForegroundDragEventKind::Down => down_type,
-                ForegroundDragEventKind::Dragged => dragged_type,
-                ForegroundDragEventKind::Up => up_type,
-            };
-            // A null source matches macOS's established global mouse-controller
-            // path. WindowServer then carries the pressed-button state from the
-            // down through every dragged event instead of treating each event as
-            // an independent HIDSystemState snapshot.
-            let event =
-                new_global_mouse_event(event_type, spec.point, cg_button).map_err(|_| {
-                    anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
-                })?;
+    let _dispatching = Dispatching::begin();
+    let (baseline, backlog) = hid_baseline();
+    let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
+        for (spec, event) in events {
+            track_queued_cursor_move(spec.point);
             event.set_flags(flags);
             crate::focus_steal::post_hid_mouse_event(&event);
 
@@ -1758,12 +1886,13 @@ where
             }
         }
         Ok(())
-    })?;
+    });
+    let settled = settle_hid_gesture(baseline, backlog, [down_type, up_type]);
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID
     // gesture, including pointer-capture release, before that restore happens.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    Ok(())
+    result.and(settled)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2473,6 +2602,114 @@ mod tests {
     use super::post_sink::{Capture, Posted};
     use super::*;
 
+    #[test]
+    fn foreground_plain_left_clicks_and_double_clicks_use_pid() {
+        // The decision has no count input: single and double clicks share it.
+        assert!(foreground_click_uses_pid("left", &[], None));
+    }
+
+    #[test]
+    fn foreground_modified_and_other_button_clicks_keep_hid() {
+        for modifiers in [["cmd"], ["shift"], ["ctrl"], ["alt"]] {
+            assert!(!foreground_click_uses_pid("left", &modifiers, None));
+        }
+        for button in ["right", "middle"] {
+            assert!(!foreground_click_uses_pid(button, &[], None));
+        }
+    }
+
+    #[test]
+    fn foreground_pointer_reading_toolkits_keep_hid() {
+        assert!(!foreground_click_uses_pid(
+            "left",
+            &[],
+            Some(super::super::pointer_toolkit::PointerReadingToolkit::Tk),
+        ));
+    }
+
+    #[test]
+    fn cursor_restore_allows_at_most_three_points_of_movement() {
+        let prior = CGPoint::new(-100.0, 50.0);
+        let target = CGPoint::new(20.0, 30.0);
+        let mut state = CursorRestoreState::default();
+        state.moving_to(prior, target);
+        for current in [
+            target,
+            CGPoint::new(20.5, 30.5),
+            CGPoint::new(23.0, 30.0),
+            CGPoint::new(21.8, 32.4),
+        ] {
+            assert_eq!(
+                state.restore_to(current).map(|p| (p.x, p.y)),
+                Some((prior.x, prior.y))
+            );
+        }
+        for current in [CGPoint::new(23.001, 30.0), CGPoint::new(22.2, 32.2)] {
+            assert!(state.restore_to(current).is_none());
+        }
+    }
+
+    #[test]
+    fn a_multistep_gesture_keeps_its_original_cursor_position() {
+        let prior = CGPoint::new(-100.0, -50.0);
+        let start = CGPoint::new(20.0, 30.0);
+        let end = CGPoint::new(200.0, 300.0);
+        let mut state = CursorRestoreState::default();
+        assert!(state.restore_to(prior).is_none());
+        state.moving_to(prior, start);
+        state.moving_to(start, start);
+        state.moving_to(start, end);
+        assert_eq!(
+            state.restore_to(end).map(|p| (p.x, p.y)),
+            Some((prior.x, prior.y))
+        );
+    }
+
+    #[test]
+    fn queued_drag_moves_restore_once_the_cursor_reaches_the_end() {
+        let prior = CGPoint::new(-100.0, -50.0);
+        let start = CGPoint::new(20.0, 30.0);
+        let end = CGPoint::new(200.0, 300.0);
+        let mut state = CursorRestoreState::default();
+        state.moving_to(prior, start);
+        // The cursor lags behind queued posts; that is not the user.
+        state.queued_to(CGPoint::new(110.0, 165.0));
+        state.queued_to(end);
+        assert!(!state.user_moved);
+        assert!(state.restore_to(CGPoint::new(110.0, 165.0)).is_none());
+        assert_eq!(
+            state.restore_to(end).map(|p| (p.x, p.y)),
+            Some((prior.x, prior.y))
+        );
+    }
+
+    #[test]
+    fn user_movement_during_a_gesture_disables_its_final_restore() {
+        let mut state = CursorRestoreState::default();
+        let start = CGPoint::new(20.0, 30.0);
+        let end = CGPoint::new(200.0, 300.0);
+        state.moving_to(CGPoint::new(-100.0, 50.0), start);
+        state.moving_to(CGPoint::new(24.0, 30.0), end);
+        assert!(state.restore_to(end).is_none());
+    }
+
+    #[test]
+    fn nested_cursor_preservation_leaves_the_restore_to_the_outer_gesture() {
+        let desktop = CursorRestore::begin(false);
+        assert!(!desktop.owner);
+        assert!(CURSOR_RESTORE.with_borrow(Option::is_none));
+        drop(desktop);
+        let outer = CursorRestore::begin(true);
+        let inner = CursorRestore::begin(true);
+        assert!(outer.owner);
+        assert!(!inner.owner);
+        drop(inner);
+        assert!(CURSOR_RESTORE.with_borrow(Option::is_some));
+        // No warp was requested, so dropping this guard reads no host state.
+        drop(outer);
+        assert!(CURSOR_RESTORE.with_borrow(Option::is_none));
+    }
+
     fn own_lock() -> &'static TurnLock {
         Box::leak(Box::new(TurnLock::new()))
     }
@@ -2934,6 +3171,78 @@ mod tests {
                     assert_eq!(p.route, want, "{name} (SPI {available}): {} transport", p.event);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn modifier_flags_support_each_key_alias_and_combinations() {
+        for (names, expected) in [
+            (
+                vec!["cmd", "command", "CMD"],
+                CGEventFlags::CGEventFlagCommand,
+            ),
+            (vec!["shift", "SHIFT"], CGEventFlags::CGEventFlagShift),
+            (
+                vec!["option", "alt", "OPTION"],
+                CGEventFlags::CGEventFlagAlternate,
+            ),
+            (
+                vec!["ctrl", "control", "CTRL"],
+                CGEventFlags::CGEventFlagControl,
+            ),
+        ] {
+            for name in names {
+                assert_eq!(parse_modifier_flags(&[name]), expected, "{name}");
+            }
+        }
+        assert_eq!(parse_modifier_flags(&[]), CGEventFlags::CGEventFlagNull);
+        assert_eq!(
+            parse_modifier_flags(&["cmd", "shift", "option", "ctrl", "cmd"]),
+            CGEventFlags::CGEventFlagCommand
+                | CGEventFlags::CGEventFlagShift
+                | CGEventFlags::CGEventFlagAlternate
+                | CGEventFlags::CGEventFlagControl,
+        );
+    }
+
+    #[test]
+    fn background_window_click_modifiers_ride_on_pid_routed_down_and_up() {
+        let modifiers = ["cmd", "shift", "option", "ctrl"];
+        let expected = parse_modifier_flags(&modifiers).bits();
+        for available in [true, false] {
+            let capture = Capture::start(available);
+            click_at_xy_with_window_local(
+                1,
+                100.0,
+                100.0,
+                10.0,
+                10.0,
+                7,
+                1,
+                &modifiers,
+                WindowClickDelivery::Background,
+            )
+            .unwrap();
+            let posted = capture.posted();
+            let names: Vec<_> = posted.iter().map(|event| event.event.as_str()).collect();
+            // Preserve the existing off-screen primer pair and the target pair.
+            assert_eq!(
+                names,
+                [
+                    "MouseMoved",
+                    "LeftMouseDown",
+                    "LeftMouseUp",
+                    "LeftMouseDown",
+                    "LeftMouseUp"
+                ]
+            );
+            let route = if available {
+                PostRoute::SkyLight
+            } else {
+                PostRoute::PublicPid
+            };
+            assert!(posted.iter().all(|event| event.route == route));
+            assert_eq!(capture.modifiers(), vec![expected; posted.len()]);
         }
     }
 

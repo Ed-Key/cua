@@ -300,20 +300,24 @@ A foreground window-scoped **pixel** `click`, `double_click`, or
 `right_click` (`x`/`y` with `window_id`) is delivered like a desktop-scope click, not through the per-pid path: Cua Driver
 activates the exact window (refusing with `foreground_unavailable` when that
 window never becomes focused), moves the hardware pointer to the mapped
-screen point, and posts through the HID event tap. The pointer stays at the
-target afterward, matching Windows `SendInput` and X11 XTest foreground
-clicks, and the prior frontmost app is restored. The result reports
-`route: "global_input"` and says the pointer moved.
+screen point, and posts through the HID event tap. After the gesture settles,
+the pointer returns to its prior position unless the user moved it, and the
+prior frontmost app is restored. The result reports `route: "global_input"` and says the pointer moved during
+the gesture.
 
-Modified clicks are the deliberate exception: pass
-`delivery_mode:"foreground"` and a concrete `window_id`. macOS applications
-can discard PID-routed modifier state after initially publishing a transient
-selection, so Cua Driver refuses that background combination. The foreground
-rung holds physical HID modifier keys around the click, restores the prior
-foreground app, and confirms list-like selection changes with a stable AX
-readback. Element-addressed modified clicks also restore the hardware cursor;
-pixel modified clicks leave it at the target like other foreground pixel
-clicks.
+Modified clicks (`cmd`, `shift`, `option`/`alt`, `ctrl`) support background
+delivery. Cua Driver sets modifier flags on mouse down and up events posted to
+the target pid, without pressing physical modifier keys, moving the hardware
+pointer, or activating the target. An `element_token` uses a pixel click at the
+element's center because AX actions cannot carry modifiers. The same background
+pointer checks apply as for plain pixel clicks, including structured refusals
+for unreachable targets. Confirm multi-selection with a fresh snapshot.
+
+The explicit `delivery_mode:"foreground"` rung still needs a concrete
+`window_id`. It holds physical HID modifier keys around the click, restores
+the prior foreground app, and confirms list-like element selection changes
+with a stable AX readback. Foreground clicks restore the hardware cursor unless
+the user moved it during the gesture.
 
 macOS-specific residuals worth knowing (the rest of the capture/dispatch/
 addressing params are a shared cross-platform contract: see `SKILL.md` →
