@@ -832,7 +832,7 @@ impl Tool for ClickTool {
             // without changing global keyboard state or activating the target.
             // That route is a press, so any other action would change meaning.
             if background_modifier_click(delivery_mode.is_foreground(), !modifiers.is_empty())
-                && effective_action != "press"
+                && ax_action != "AXPress"
             {
                 return ToolResult::error(format!(
                     "Background modifier clicks carry only a press; action \"{effective_action}\" \
