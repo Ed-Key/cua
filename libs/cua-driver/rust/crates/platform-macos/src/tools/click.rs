@@ -1829,12 +1829,9 @@ impl Tool for ClickTool {
                     crate::background_mutation::spawn_blocking(move || {
                         let do_click = move || -> anyhow::Result<Option<crate::input::mouse::ForegroundClick>> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                            if let (PixelClickRoute::ForegroundHid, Some(wid)) = (route, window_id) {
-                                // Warp the hardware pointer to the mapped global
-                                // point and post at the HID tap (or to the pid
-                                // around another process's active tap). The pointer
-                                // stays there through the gesture and its settle,
-                                // then returns unless the user moved it.
+                            if let (PixelClickRoute::Foreground, Some(wid)) = (route, window_id) {
+                                // Plain left clicks go to the pid without a warp;
+                                // pointer-reading toolkits and other clicks use HID.
                                 return crate::input::mouse::foreground_click(
                                     pid,
                                     wid,
@@ -1870,12 +1867,11 @@ impl Tool for ClickTool {
                             };
                             sent.map(|()| None)
                         };
-                        // Foreground rung: front the exact window → HID click →
-                        // restore the prior front process. The HID tap has no
-                        // pid addressing, so activation must be proven (the
-                        // window is AX-focused) or no input is sent.
+                        // Front the exact window before dispatch, then restore
+                        // the prior front process. No input is sent unless the
+                        // target window is proven focused and unobscured.
                         match (route, window_id) {
-                            (PixelClickRoute::ForegroundHid, Some(wid)) => {
+                            (PixelClickRoute::Foreground, Some(wid)) => {
                                 crate::input::skylight::with_foreground_pointer_activation(
                                     pid as libc::pid_t,
                                     wid,
@@ -1916,7 +1912,7 @@ impl Tool for ClickTool {
             };
             match result {
                 Ok(Ok(sent)) => {
-                    let target = if route == PixelClickRoute::ForegroundHid {
+                    let target = if route == PixelClickRoute::Foreground {
                         format!("at screen-point ({screen_x:.0},{screen_y:.0}) for pid {pid}")
                     } else {
                         format!("to pid {pid}")
@@ -1940,7 +1936,7 @@ impl Tool for ClickTool {
                     )
                     .expect("checked by the guard")
                 }
-                Ok(Err(e)) if route == PixelClickRoute::ForegroundHid => {
+                Ok(Err(e)) if route == PixelClickRoute::Foreground => {
                     super::pixel_route::foreground_unavailable(
                         button_label,
                         window_id.unwrap_or_default(),

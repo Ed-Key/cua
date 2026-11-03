@@ -708,10 +708,9 @@ impl Tool for DoubleClickTool {
             };
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::input::mouse::ForegroundClick>> {
             let do_click = move || -> anyhow::Result<Option<crate::input::mouse::ForegroundClick>> {
-                if let (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) = (route, window_id) {
-                    // Warp the hardware pointer and post at the HID tap (or to
-                    // the pid around another process's active tap); see
-                    // `pixel_route` for the cross-platform foreground contract.
+                if let (super::pixel_route::PixelClickRoute::Foreground, Some(wid)) = (route, window_id) {
+                    // Post to the pid without a warp, except for pointer-reading
+                    // toolkits, which need HID delivery at the hardware pointer.
                     return crate::input::mouse::foreground_click(
                         pid,
                         wid,
@@ -740,11 +739,10 @@ impl Tool for DoubleClickTool {
                 };
                 sent.map(|()| None)
             };
-            // Foreground rung: front the exact window → HID double-click →
-            // restore the prior frontmost. No input is sent unless the exact
-            // window is proven focused.
+            // Front the exact window, dispatch, then restore the prior frontmost.
+            // No input is sent unless the target is focused and unobscured.
             match (route, window_id) {
-                (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) => {
+                (super::pixel_route::PixelClickRoute::Foreground, Some(wid)) => {
                     crate::input::skylight::with_foreground_pointer_activation(
                         pid as libc::pid_t,
                         wid,
@@ -772,7 +770,7 @@ impl Tool for DoubleClickTool {
                 )
                 .expect("checked by the guard")
             }
-            Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::ForegroundHid => {
+            Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::Foreground => {
                 super::pixel_route::foreground_unavailable(
                     "Double-click",
                     window_id.unwrap_or_default(),

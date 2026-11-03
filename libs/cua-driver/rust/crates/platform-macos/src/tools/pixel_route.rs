@@ -1,16 +1,12 @@
 //! Transport selection for window-addressed pixel clicks (`click`,
 //! `double_click`, `right_click`) on macOS.
 //!
-//! The cross-platform foreground contract is that a foreground pixel click
-//! moves the system pointer to the target and delivers real input there:
-//! Windows uses `SetCursorPos` + `SendInput`, X11 uses an XTest warp + button,
-//! and macOS desktop scope and foreground drags warp the pointer and post at the
-//! HID tap. Window-scoped foreground pixel clicks follow the same model, so apps
-//! that derive a click location from the hardware pointer (Tk, some Java and
-//! game toolkits) receive it at the right point. Background delivery stays
-//! PID-routed and never moves the pointer; a detectable pointer-reading toolkit
-//! refuses with the shared `background_unavailable` contract instead of
-//! reporting an unverifiable success.
+//! On macOS, plain foreground left clicks use pid delivery without moving the
+//! hardware pointer, as native Computer Use does. Pointer-reading toolkits,
+//! modified clicks, other buttons, desktop scope and drags keep HID delivery
+//! with a pointer warp. Windows and X11 retain their existing foreground input
+//! routes. Background delivery stays PID-routed and never moves the pointer;
+//! a detectable pointer-reading toolkit refuses with `background_unavailable`.
 
 use cua_driver_core::protocol::ToolResult;
 
@@ -20,11 +16,10 @@ use crate::input::pointer_toolkit::PointerReadingToolkit;
 /// declined (or was not eligible).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PixelClickRoute {
-    /// Explicit foreground rung with an exact window: activate that window,
-    /// move the hardware pointer to the mapped global point, and post through
-    /// the global HID event tap. On macOS the pointer returns after settling
-    /// unless the user moved it during the gesture.
-    ForegroundHid,
+    /// Activate the exact window, then dispatch via `foreground_click` (pid
+    /// for plain left clicks, HID for pointer-reading toolkits or other clicks).
+    /// The right_click tool keeps its HID route.
+    Foreground,
     /// Background delivery routed to the target pid. The hardware pointer is
     /// never moved, so the result stays "not driver-verified".
     BackgroundPid,
@@ -34,15 +29,15 @@ pub(crate) enum PixelClickRoute {
 }
 
 /// Pure route decision. `effective_foreground` is the requested foreground
-/// rung; it only selects the HID route with an exact window, because the HID
-/// tap has no pid addressing.
+/// rung; it requires an exact window for activation and the occlusion check.
+/// The click primitive then selects the foreground transport.
 pub(crate) fn pixel_click_route(
     effective_foreground: bool,
     has_window: bool,
     toolkit: Option<PointerReadingToolkit>,
 ) -> PixelClickRoute {
     if effective_foreground && has_window {
-        return PixelClickRoute::ForegroundHid;
+        return PixelClickRoute::Foreground;
     }
     match toolkit {
         Some(toolkit) if has_window => PixelClickRoute::RefuseBackground(toolkit),
@@ -104,7 +99,7 @@ pub(crate) fn pointer_reading_background_refusal(
 /// Human-readable delivery note appended to a successful pixel click result.
 pub(crate) fn delivery_note(route: PixelClickRoute) -> &'static str {
     match route {
-        PixelClickRoute::ForegroundHid => {
+        PixelClickRoute::Foreground => {
             "foreground: exact window activated and confirmed topmost at the point, \
              hardware pointer moved to the target, HID event tap; the click's effect is \
              not driver-verified — confirm via screenshot"
@@ -123,7 +118,7 @@ pub(crate) fn delivery_note(route: PixelClickRoute) -> &'static str {
 /// `cgevent` to the PID transport with background delivery.
 pub(crate) fn path_label(route: PixelClickRoute) -> &'static str {
     match route {
-        PixelClickRoute::ForegroundHid => "cgevent_fg",
+        PixelClickRoute::Foreground => "cgevent_fg",
         _ => "cgevent",
     }
 }
@@ -134,10 +129,6 @@ pub(crate) fn is_pointer_refusal(cause: &anyhow::Error) -> bool {
     cause.is::<crate::input::skylight::TargetOccluded>() || cause.is::<crate::pip::PipHeldByUser>()
 }
 
-/// Structured error for a foreground HID click whose exact-window activation
-/// or dispatch failed. No input reaches another window in that case. A
-/// window left covering the point after the raise is `target_occluded`,
-/// naming it.
 /// The delivery note and legacy `path` label for a click sent on `route`;
 /// `sent` is how the foreground rung sent it (None: not that rung).
 pub(crate) fn sent_note(
@@ -154,17 +145,26 @@ pub(crate) fn sent_note(
                 .into(),
             path_label(route),
         ),
-        Some(ForegroundClick::PidAroundTap { tap_owner }) => (
-            format!(
-                "foreground: exact window activated and confirmed topmost at the point, hardware \
-                 pointer moved to the target; posted to the pid, not the HID event tap, because \
-                 pid {tap_owner} ({}) holds an active event tap on clicks that could drop or hold \
-                 it; the click's effect is not driver-verified — confirm via screenshot",
-                crate::apps::get_app_name_for_pid(tap_owner).unwrap_or_else(|| "unknown app".into())
-            ),
-            // The pid transport with foreground delivery.
-            "cgevent_pid_fg",
-        ),
+        Some(ForegroundClick::Pid { tap_owner }) => {
+            let tap_note = tap_owner
+                .map(|owner| {
+                    format!(
+                        "; bypassed the active click event tap held by pid {owner} ({})",
+                        crate::apps::get_app_name_for_pid(owner)
+                            .unwrap_or_else(|| "unknown app".into())
+                    )
+                })
+                .unwrap_or_default();
+            (
+                format!(
+                    "foreground: exact window activated and confirmed topmost at the point, \
+                     posted to the pid with window-local coordinates; the hardware pointer was \
+                     not moved{tap_note}; the click's effect is not driver-verified: confirm \
+                     via screenshot"
+                ),
+                "cgevent_pid_fg",
+            )
+        }
         Some(ForegroundClick::Hid(_)) | None => (delivery_note(route).into(), path_label(route)),
     }
 }
@@ -188,6 +188,8 @@ pub(crate) fn not_confirmed(action: &str, cause: &anyhow::Error) -> Option<ToolR
     )
 }
 
+/// Structured error when foreground activation or dispatch failed. A window
+/// covering the point after the raise is named by `target_occluded`.
 pub(crate) fn foreground_unavailable(
     action: &str,
     window_id: u32,
@@ -223,7 +225,7 @@ pub(crate) fn foreground_unavailable(
         );
     }
     ToolResult::error(format!(
-        "{action} failed: foreground HID delivery to window {window_id} was not possible: \
+        "{action} failed: foreground delivery to window {window_id} was not possible: \
          {cause}"
     ))
     .with_structured(serde_json::json!({ "code": "foreground_unavailable" }))
@@ -233,21 +235,19 @@ pub(crate) fn foreground_unavailable(
 mod tests {
     use super::*;
 
-    /// D-MAC-6: a foreground window pixel click must use the HID tap with a
-    /// real pointer move (Tk reads the hardware pointer), background clicks
-    /// keep PID routing, and a known pointer-reading toolkit refuses
-    /// background delivery instead of reporting an unverifiable success.
+    /// Foreground delivery needs an exact window; background delivery refuses
+    /// a known pointer-reading toolkit before dispatch.
     #[test]
-    fn pixel_click_route_moves_pointer_only_for_foreground_and_refuses_tk_background() {
+    fn pixel_click_route_requires_a_foreground_window_and_refuses_tk_background() {
         let tk = Some(PointerReadingToolkit::Tk);
         assert_eq!(
             pixel_click_route(true, true, None),
-            PixelClickRoute::ForegroundHid
+            PixelClickRoute::Foreground
         );
         assert_eq!(
             pixel_click_route(true, true, tk),
-            PixelClickRoute::ForegroundHid,
-            "foreground delivery moves the pointer, so Tk is supported"
+            PixelClickRoute::Foreground,
+            "foreground delivery lets the click primitive use HID for Tk"
         );
         assert_eq!(
             pixel_click_route(false, true, None),
@@ -265,16 +265,52 @@ mod tests {
         assert_eq!(
             pixel_click_route(true, false, None),
             PixelClickRoute::BackgroundPid,
-            "foreground without an exact window cannot use the unaddressed HID tap"
+            "foreground delivery requires an exact window"
         );
     }
 
     #[test]
     fn route_labels_say_what_actually_happened() {
-        assert_eq!(path_label(PixelClickRoute::ForegroundHid), "cgevent_fg");
+        assert_eq!(path_label(PixelClickRoute::Foreground), "cgevent_fg");
         assert_eq!(path_label(PixelClickRoute::BackgroundPid), "cgevent");
-        assert!(delivery_note(PixelClickRoute::ForegroundHid).contains("hardware pointer moved"));
+        assert!(delivery_note(PixelClickRoute::Foreground).contains("hardware pointer moved"));
         assert!(delivery_note(PixelClickRoute::BackgroundPid).contains("pointer was not moved"));
+    }
+
+    #[test]
+    fn foreground_pid_results_report_no_pointer_move_and_the_optional_tap_owner() {
+        use crate::input::mouse::ForegroundClick;
+        let (note, path) = sent_note(
+            PixelClickRoute::Foreground,
+            Some(ForegroundClick::Pid { tap_owner: None }),
+        );
+        assert_eq!(path, "cgevent_pid_fg");
+        assert!(note.contains("posted to the pid with window-local coordinates"));
+        assert!(note.contains("hardware pointer was not moved"));
+        assert!(!note.contains("active click event tap"));
+
+        // No process can have this pid on macOS, so the app name is deterministic.
+        let (note, path) = sent_note(
+            PixelClickRoute::Foreground,
+            Some(ForegroundClick::Pid {
+                tap_owner: Some(i32::MAX),
+            }),
+        );
+        assert_eq!(path, "cgevent_pid_fg");
+        assert!(note.contains("hardware pointer was not moved"));
+        assert!(note.contains("active click event tap held by pid 2147483647 (unknown app)"));
+    }
+
+    #[test]
+    fn foreground_hid_results_keep_the_hid_path_and_passage_note() {
+        use crate::input::mouse::{ForegroundClick, HidPassage};
+        let (note, path) = sent_note(
+            PixelClickRoute::Foreground,
+            Some(ForegroundClick::Hid(HidPassage::Passed)),
+        );
+        assert_eq!(path, "cgevent_fg");
+        assert!(note.contains("hardware pointer moved"));
+        assert!(note.contains("past every event tap"));
     }
 
     #[test]

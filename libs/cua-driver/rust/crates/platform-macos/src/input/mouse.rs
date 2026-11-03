@@ -412,11 +412,9 @@ fn click_at_xy_desktop_inner(
             CGMouseButton::Left,
         ),
     };
-    // Warp the REAL cursor to the point first (the macOS peer of Linux XTest's
-    // pointer warp). A synthetic MouseMoved event does not relocate the hardware
-    // cursor, and AppKit hit-tests some clicks against the actual cursor
-    // position, so without the warp the down/up can miss the target. Desktop
-    // scope is the foreground modality, so moving the visible cursor is expected.
+    // HID delivery needs the hardware pointer at the target, including for
+    // pointer-reading toolkits. Plain left clicks to other app windows use
+    // pid delivery without a warp, as native Computer Use does.
     track_cursor_move(point)?;
     let _ = CGDisplay::warp_mouse_cursor_position(point);
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
@@ -959,17 +957,16 @@ pub fn foreign_active_tap(mask: u64) -> Option<i32> {
 pub enum ForegroundClick {
     /// At the HID tap, and the system passed it on past every session tap.
     Hid(HidPassage),
-    /// To the target pid with its window fields, because `tap_owner` holds an
-    /// active tap on left clicks that could drop or hold a HID click.
-    PidAroundTap { tap_owner: i32 },
+    /// To the target pid with its window fields, without moving the pointer.
+    /// `tap_owner`, when present, holds an active tap bypassed by this route.
+    Pid { tap_owner: Option<i32> },
 }
 
 /// The foreground click primitive, run inside the exact-window activation
 /// guard (`with_foreground_pointer_activation`), after the occlusion check.
-/// Decided before dispatch: a plain left click goes to the pid when another
-/// process holds an active tap on left clicks (native Computer Use always
-/// posts clicks to the pid); everything else is a HID click whose passage is
-/// confirmed ([`click_at_xy_desktop_inner`]).
+/// Plain left clicks go to the pid without moving the pointer, as native
+/// Computer Use does. Pointer-reading toolkits and other clicks use HID
+/// delivery whose passage is confirmed ([`click_at_xy_desktop_inner`]).
 #[allow(clippy::too_many_arguments)]
 pub fn foreground_click(
     pid: i32,
@@ -981,22 +978,31 @@ pub fn foreground_click(
     modifiers: &[&str],
 ) -> anyhow::Result<ForegroundClick> {
     let _turn = hold_foreground_turn()?;
-    let _restore = CursorRestore::begin(true);
-    if button == "left" && modifiers.is_empty() {
+    let toolkit = if button == "left" && modifiers.is_empty() {
+        super::pointer_toolkit::detect(pid)
+    } else {
+        None
+    };
+    if foreground_click_uses_pid(button, modifiers, toolkit) {
         let left = event_mask(&[CGEventType::LeftMouseDown, CGEventType::LeftMouseUp]);
-        if let Some(tap_owner) = foreign_active_tap(left) {
-            // The pointer goes to the target as on the HID route, so apps
-            // that read it see it there.
-            move_cursor_desktop(x, y)?;
-            let result = click_at_xy_with_window_local(
-                pid, x, y, wx, wy, wid, count.max(1), &[], WindowClickDelivery::Foreground,
-            );
-            std::thread::sleep(std::time::Duration::from_millis(40));
-            result?;
-            return Ok(ForegroundClick::PidAroundTap { tap_owner });
-        }
+        let tap_owner = foreign_active_tap(left);
+        let result = click_at_xy_with_window_local(
+            pid, x, y, wx, wy, wid, count.max(1), &[], WindowClickDelivery::Foreground,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        result?;
+        return Ok(ForegroundClick::Pid { tap_owner });
     }
     click_at_xy_desktop_inner(x, y, count, button, modifiers, true).map(ForegroundClick::Hid)
+}
+
+// Click count does not affect transport: single and double clicks share it.
+fn foreground_click_uses_pid(
+    button: &str,
+    modifiers: &[&str],
+    toolkit: Option<super::pointer_toolkit::PointerReadingToolkit>,
+) -> bool {
+    button == "left" && modifiers.is_empty() && toolkit.is_none()
 }
 
 /// Move the real hardware cursor to a logical desktop point.
@@ -1136,9 +1142,6 @@ fn click_at_xy_inner(
         // mouseMoved so an AppKit NSButton / NSView hit-tests the down at the
         // right point. Without it the synthetic mouseDown on a backgrounded
         // AppKit control is silently ignored.
-        if post_mode == MousePostMode::PublicOnly {
-            track_cursor_move(point)?;
-        }
         post_mouse_moved_primer(pid, &source, point, window_local, wid, post_mode);
         std::thread::sleep(std::time::Duration::from_millis(12));
 
@@ -1169,9 +1172,6 @@ fn click_at_xy_inner(
                 .then(make_up)
                 .transpose()?;
 
-            if post_mode == MousePostMode::PublicOnly {
-                track_cursor_move(point)?;
-            }
             post_mouse_event_with_mode(pid, &down, window_local, wid, click_state, 0, 3, post_mode);
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
             // tracking loop that polls for the matching mouseUp; too tight a
@@ -1186,9 +1186,6 @@ fn click_at_xy_inner(
             // otherwise carry whatever modifiers the user physically holds.
             up.set_flags(flags);
 
-            if post_mode == MousePostMode::PublicOnly {
-                track_cursor_move(point)?;
-            }
             post_mouse_event_with_mode(pid, &up, window_local, wid, click_state, 0, 3, post_mode);
 
             if count > 1 {
@@ -2602,6 +2599,31 @@ mod post_sink {
 mod tests {
     use super::post_sink::{Capture, Posted};
     use super::*;
+
+    #[test]
+    fn foreground_plain_left_clicks_and_double_clicks_use_pid() {
+        // The decision has no count input: single and double clicks share it.
+        assert!(foreground_click_uses_pid("left", &[], None));
+    }
+
+    #[test]
+    fn foreground_modified_and_other_button_clicks_keep_hid() {
+        for modifiers in [["cmd"], ["shift"], ["ctrl"], ["alt"]] {
+            assert!(!foreground_click_uses_pid("left", &modifiers, None));
+        }
+        for button in ["right", "middle"] {
+            assert!(!foreground_click_uses_pid(button, &[], None));
+        }
+    }
+
+    #[test]
+    fn foreground_pointer_reading_toolkits_keep_hid() {
+        assert!(!foreground_click_uses_pid(
+            "left",
+            &[],
+            Some(super::super::pointer_toolkit::PointerReadingToolkit::Tk),
+        ));
+    }
 
     #[test]
     fn cursor_restore_allows_at_most_three_points_of_movement() {

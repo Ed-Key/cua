@@ -233,7 +233,7 @@ impl Tool for RightClickTool {
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let do_it = move || -> anyhow::Result<()> {
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                if route == super::pixel_route::PixelClickRoute::ForegroundHid {
+                if route == super::pixel_route::PixelClickRoute::Foreground {
                     // Warp the hardware pointer and post at the HID tap; see
                     // `pixel_route` for the cross-platform foreground contract.
                     return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
@@ -258,7 +258,7 @@ impl Tool for RightClickTool {
             // restore the prior frontmost. No input is sent unless the exact
             // window is proven focused.
             match (route, window_id) {
-                (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) => {
+                (super::pixel_route::PixelClickRoute::Foreground, Some(wid)) => {
                     crate::input::skylight::with_foreground_pointer_activation(
                         pid as libc::pid_t,
                         wid,
@@ -285,7 +285,7 @@ impl Tool for RightClickTool {
                 )
                 .expect("checked by the guard")
             }
-            Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::ForegroundHid => {
+            Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::Foreground => {
                 super::pixel_route::foreground_unavailable(
                     "Right-click",
                     window_id.unwrap_or_default(),
