@@ -2,7 +2,8 @@
 //!
 //! Two addressing modes:
 //!
-//! * **AX path** (`element_token`): performs AXAction on the cached
+//! * **AX path** (`element_token`): background modifier clicks use the pixel
+//!   path at the element's center. Plain clicks perform AXAction on the cached
 //!   element. Fires via AX RPC — the target app never needs to be frontmost.
 //!   Extra behaviors vs. the naive dispatch:
 //!   - AXTextField / AXTextArea: 800 ms post-click delay for WebKit DOM focus settle.
@@ -313,14 +314,19 @@ fn pixel_activation_policy(
     button: &str,
     effective_foreground: bool,
     has_window: bool,
+    has_modifiers: bool,
 ) -> PixelActivationPolicy {
     if effective_foreground {
         PixelActivationPolicy::ForegroundAssist
-    } else if button == "left" && has_window {
+    } else if button == "left" && has_window && !has_modifiers {
         PixelActivationPolicy::AllowTargetWithoutRaise
     } else {
         PixelActivationPolicy::SuppressTarget
     }
+}
+
+fn background_modifier_click(foreground: bool, has_modifiers: bool) -> bool {
+    !foreground && has_modifiers
 }
 
 /// Return the prior foreground pid that should be restored after a raw
@@ -396,7 +402,8 @@ fn def() -> &'static ToolDef {
              on background or hidden windows without moving the pointer. Use x,y in \
              get_window_state screenshot pixels (include_screenshot:true) only for surfaces \
              missing from the tree. To \
-             choose a pop-up option use set_value. Background by default. \
+             choose a pop-up option use set_value. Background modifier clicks use mouse-event \
+             flags at the element center or x,y and need a reachable window. Background by default. \
              Details: skill://cua-driver/WORKFLOW.md"
             .into(),
         input_schema: serde_json::json!({
@@ -426,7 +433,7 @@ fn def() -> &'static ToolDef {
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Modifier keys: cmd, shift, option/alt, ctrl. Needs delivery_mode \"foreground\"."
+                    "description": "Modifier keys: cmd, shift, option/alt, ctrl. Background clicks carry flags on PID-routed mouse events without pressing physical keys. Element clicks use their center."
                 },
                 "from_zoom": {
                     "type": "boolean",
@@ -681,21 +688,17 @@ impl Tool for ClickTool {
         // element. Ingress strips underscore arguments from public callers.
         let pointer_only = args.get("_pointer_only").and_then(Value::as_bool) == Some(true);
 
-        // PID-routed key transitions can look correct for one AX poll and then
-        // collapse to a plain click once AppKit resolves the gesture. Refuse
-        // that false-success path. The explicit foreground rung uses physical
-        // HID modifier transitions under an exact-window activation guard.
-        if !modifiers.is_empty() && (!delivery_mode.is_foreground() || window_id.is_none()) {
+        // The foreground HID route still requires an exact-window guard.
+        if !modifiers.is_empty() && delivery_mode.is_foreground() && window_id.is_none() {
             return ToolResult::error(
-                "click modifiers require delivery_mode:\"foreground\" and window_id on macOS; \
-                 background PID-routed events cannot preserve live modifier-key state",
+                "Foreground modifier clicks require window_id on macOS.",
             )
             .with_structured(serde_json::json!({
                 "code": "background_unavailable",
                 "effect": "refused",
                 "escalation": {
                     "recommended": "foreground",
-                    "reason": "macOS modifier clicks require exact-window HID delivery so the target observes live modifier state"
+                    "reason": "Foreground modifier clicks require an exact window for HID delivery"
                 }
             }));
         }
@@ -744,13 +747,16 @@ impl Tool for ClickTool {
             let element_ptr = element_guard.as_ptr();
 
             // ── Exact-target background gate (macOS background input v1) ──
-            // The element branch is semantic AX delivery, except button=middle
-            // which falls back to a routed pixel click at the element's center
-            // and is therefore held to the stricter WindowPointer rung. Gate
+            // Middle and background modifier clicks use routed pixel delivery
+            // at the element's center and need the WindowPointer rung. Gate
             // BEFORE any cursor/dispatch work so a stale or sibling-owned
             // target refuses instead of acting on the wrong window.
             let _mutation_lease = if !delivery_mode.is_foreground() {
-                let gate_action = if button_str == "middle" {
+                let gate_action = if button_str == "middle"
+                    || background_modifier_click(
+                        delivery_mode.is_foreground(),
+                        !modifiers.is_empty(),
+                    ) {
                     cua_driver_core::background_input::BackgroundAction::WindowPointer
                 } else {
                     cua_driver_core::background_input::BackgroundAction::AxSemantic
@@ -821,6 +827,24 @@ impl Tool for ClickTool {
             })
             .await
             .unwrap_or((None, None));
+
+            // AX actions cannot carry modifiers. Reuse the admitted pixel route
+            // without changing global keyboard state or activating the target.
+            if background_modifier_click(delivery_mode.is_foreground(), !modifiers.is_empty()) {
+                return self
+                    .click_element_by_pointer(
+                        &args,
+                        (pid, wid),
+                        (idx, press_row.clone()),
+                        element_guard.clone(),
+                        center,
+                        "AX actions cannot carry click modifiers",
+                        false,
+                        _mutation_lease.as_ref(),
+                        false,
+                    )
+                    .await;
+            }
 
             // Surface 5: button=middle on the AX path has no AX equivalent.
             // Fall back to a pixel middle-click at the element's screen-space center
@@ -1727,7 +1751,8 @@ impl Tool for ClickTool {
                 Ok(route) => route,
                 Err(refusal) => return refusal,
             };
-            let activation_policy = pixel_activation_policy(&button_str, fg, window_id.is_some());
+            let activation_policy =
+                pixel_activation_policy(&button_str, fg, window_id.is_some(), !modifiers.is_empty());
 
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
             // A pixel click can land on a "Sign In" button that opens a sheet
@@ -1932,8 +1957,8 @@ impl Tool for ClickTool {
 }
 
 impl ClickTool {
-    /// The element path's pointer delivery, for an element that offers no
-    /// press: one routed pointer click (background) or HID click
+    /// The element path's pointer delivery, for background modifier clicks or
+    /// an element that offers no press: a routed pointer click or HID click
     /// (foreground) at its centre, through the pixel path, after proving
     /// that the centre reaches the element in its window. Refuses, sending
     /// nothing, when the element is disabled, has no centre, its centre lands
@@ -2014,6 +2039,17 @@ impl ClickTool {
             "_window_native_pixels": true,
             "_pointer_only": true,
         });
+        let has_modifiers = args
+            .get("modifier")
+            .and_then(Value::as_array)
+            .is_some_and(|modifiers| !modifiers.is_empty());
+        if background_modifier_click(foreground, has_modifiers) {
+            for key in ["button", "count"] {
+                if let Some(value) = args.get(key) {
+                    click_args[key] = value.clone();
+                }
+            }
+        }
         for key in ["session", "_session_id", "modifier"] {
             if let Some(value) = args.get(key) {
                 click_args[key] = value.clone();
@@ -2597,6 +2633,40 @@ mod settled_hit_tests {
 mod click_dispatch_tests {
     use super::{click_dispatch, hit_test_delivers_via_ax, page_element_takes_pointer, ClickDispatch};
 
+    #[test]
+    fn background_modifiers_use_element_center_pointer_and_suppress_activation() {
+        use super::super::DeliveryMode;
+        use super::{background_modifier_click, pixel_activation_policy, PixelActivationPolicy};
+        use PixelActivationPolicy::{AllowTargetWithoutRaise, ForegroundAssist, SuppressTarget};
+
+        for (mode, has_modifiers, pointer, policy) in [
+            (None, false, false, AllowTargetWithoutRaise),
+            (None, true, true, SuppressTarget),
+            (Some("background"), false, false, AllowTargetWithoutRaise),
+            (Some("background"), true, true, SuppressTarget),
+            (Some("foreground"), false, false, ForegroundAssist),
+            (Some("foreground"), true, false, ForegroundAssist),
+        ] {
+            let foreground = DeliveryMode::parse(mode).is_foreground();
+            assert_eq!(
+                background_modifier_click(foreground, has_modifiers),
+                pointer
+            );
+            assert_eq!(
+                pixel_activation_policy("left", foreground, true, has_modifiers),
+                policy
+            );
+            if has_modifiers {
+                for button in ["right", "middle"] {
+                    assert_eq!(
+                        pixel_activation_policy(button, foreground, true, true),
+                        policy
+                    );
+                }
+            }
+        }
+    }
+
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| name.to_string()).collect()
     }
@@ -3010,7 +3080,8 @@ impl Drop for LiveRowIo<'_> {
 /// The pointer rung is a raw left click into an exact window, so in the
 /// background it takes the pixel dispatcher's activate-without-raise recipe.
 fn pointer_rung_activates_without_raise(foreground: bool) -> bool {
-    pixel_activation_policy("left", foreground, true) == PixelActivationPolicy::AllowTargetWithoutRaise
+    pixel_activation_policy("left", foreground, true, false)
+        == PixelActivationPolicy::AllowTargetWithoutRaise
 }
 
 /// Whether the row still reads the name it had when the climb began:
@@ -3582,23 +3653,23 @@ mod tests {
     #[test]
     fn raw_background_left_click_restores_focus_without_raise_policy() {
         assert_eq!(
-            pixel_activation_policy("left", false, true),
+            pixel_activation_policy("left", false, true, false),
             PixelActivationPolicy::AllowTargetWithoutRaise
         );
         assert_eq!(
-            pixel_activation_policy("left", false, false),
+            pixel_activation_policy("left", false, false, false),
             PixelActivationPolicy::SuppressTarget
         );
         assert_eq!(
-            pixel_activation_policy("right", false, true),
+            pixel_activation_policy("right", false, true, false),
             PixelActivationPolicy::SuppressTarget
         );
         assert_eq!(
-            pixel_activation_policy("middle", false, true),
+            pixel_activation_policy("middle", false, true, false),
             PixelActivationPolicy::SuppressTarget
         );
         assert_eq!(
-            pixel_activation_policy("left", true, true),
+            pixel_activation_policy("left", true, true, false),
             PixelActivationPolicy::ForegroundAssist
         );
     }

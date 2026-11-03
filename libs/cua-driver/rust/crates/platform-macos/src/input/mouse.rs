@@ -3151,6 +3151,78 @@ mod tests {
     }
 
     #[test]
+    fn modifier_flags_support_each_key_alias_and_combinations() {
+        for (names, expected) in [
+            (
+                vec!["cmd", "command", "CMD"],
+                CGEventFlags::CGEventFlagCommand,
+            ),
+            (vec!["shift", "SHIFT"], CGEventFlags::CGEventFlagShift),
+            (
+                vec!["option", "alt", "OPTION"],
+                CGEventFlags::CGEventFlagAlternate,
+            ),
+            (
+                vec!["ctrl", "control", "CTRL"],
+                CGEventFlags::CGEventFlagControl,
+            ),
+        ] {
+            for name in names {
+                assert_eq!(parse_modifier_flags(&[name]), expected, "{name}");
+            }
+        }
+        assert_eq!(parse_modifier_flags(&[]), CGEventFlags::CGEventFlagNull);
+        assert_eq!(
+            parse_modifier_flags(&["cmd", "shift", "option", "ctrl", "cmd"]),
+            CGEventFlags::CGEventFlagCommand
+                | CGEventFlags::CGEventFlagShift
+                | CGEventFlags::CGEventFlagAlternate
+                | CGEventFlags::CGEventFlagControl,
+        );
+    }
+
+    #[test]
+    fn background_window_click_modifiers_ride_on_pid_routed_down_and_up() {
+        let modifiers = ["cmd", "shift", "option", "ctrl"];
+        let expected = parse_modifier_flags(&modifiers).bits();
+        for available in [true, false] {
+            let capture = Capture::start(available);
+            click_at_xy_with_window_local(
+                1,
+                100.0,
+                100.0,
+                10.0,
+                10.0,
+                7,
+                1,
+                &modifiers,
+                WindowClickDelivery::Background,
+            )
+            .unwrap();
+            let posted = capture.posted();
+            let names: Vec<_> = posted.iter().map(|event| event.event.as_str()).collect();
+            // Preserve the existing off-screen primer pair and the target pair.
+            assert_eq!(
+                names,
+                [
+                    "MouseMoved",
+                    "LeftMouseDown",
+                    "LeftMouseUp",
+                    "LeftMouseDown",
+                    "LeftMouseUp"
+                ]
+            );
+            let route = if available {
+                PostRoute::SkyLight
+            } else {
+                PostRoute::PublicPid
+            };
+            assert!(posted.iter().all(|event| event.route == route));
+            assert_eq!(capture.modifiers(), vec![expected; posted.len()]);
+        }
+    }
+
+    #[test]
     fn right_click_modifiers_ride_on_the_single_down_and_up() {
         let capture = Capture::start(true);
         right_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, 7, &["cmd", "shift"])

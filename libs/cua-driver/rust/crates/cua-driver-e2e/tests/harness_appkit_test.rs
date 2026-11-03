@@ -1793,59 +1793,76 @@ fn harness_appkit_modified_click_preserves_selection() {
             DriverRoute::MacosCgEventHid,
         ),
         |pid, wid, driver| {
-            let first = snapshot_elements(driver, pid, wid);
-            let alpha = element_token_by_id(&first, "selection-alpha");
-            let select_alpha = driver.call(
-                "click",
-                serde_json::json!({
-                    "pid": pid as i64,
-                    "window_id": wid,
-                    "element_token": alpha
-                }),
-            );
-            assert!(
-                !select_alpha.is_error(),
-                "select alpha failed: {}",
-                select_alpha.text()
-            );
-            std::thread::sleep(Duration::from_millis(200));
+            let (after_background, passed) = run_with_background_oracles(
+                driver,
+                TargetWindow {
+                    pid,
+                    native_id: wid,
+                },
+                |driver| {
+                    let first = snapshot_elements(driver, pid, wid);
+                    let alpha = element_token_by_id(&first, "selection-alpha");
+                    let select_alpha = driver.call(
+                        "click",
+                        serde_json::json!({
+                            "pid": pid as i64,
+                            "window_id": wid,
+                            "element_token": alpha
+                        }),
+                    );
+                    assert!(
+                        !select_alpha.is_error(),
+                        "select alpha failed: {}",
+                        select_alpha.text()
+                    );
+                    std::thread::sleep(Duration::from_millis(200));
 
-            let second = snapshot_elements(driver, pid, wid);
-            assert!(
-                second.tree_text().contains("selection=alpha"),
-                "alpha was not selected:\n{}",
-                second.tree_text()
-            );
-            let beta = element_token_by_id(&second, "selection-beta");
-            let refused_background = driver.call(
-                "click",
-                serde_json::json!({
-                    "pid": pid as i64,
-                    "window_id": wid,
-                    "element_token": beta,
-                    "modifier": ["cmd"]
-                }),
-            );
-            assert!(
-                refused_background.is_error(),
-                "background modified click was not refused: {}",
-                refused_background.text()
-            );
-            assert_eq!(
-                refused_background.structured()["code"],
-                "background_unavailable",
-                "background modified click returned the wrong refusal: {}",
-                refused_background.structured()
-            );
-            std::thread::sleep(Duration::from_millis(300));
-            let after_refusal = snapshot_elements(driver, pid, wid);
-            assert!(
-                after_refusal.tree_text().contains("selection=alpha"),
-                "refused modified click changed the prior selection:\n{}",
-                after_refusal.tree_text()
-            );
+                    let second = snapshot_elements(driver, pid, wid);
+                    assert!(
+                        second.tree_text().contains("selection=alpha"),
+                        "alpha was not selected:\n{}",
+                        second.tree_text()
+                    );
+                    let beta = element_token_by_id(&second, "selection-beta");
+                    let add_beta_background = driver.call(
+                        "click",
+                        serde_json::json!({
+                            "pid": pid as i64,
+                            "window_id": wid,
+                            "element_token": beta,
+                            "modifier": ["cmd"]
+                        }),
+                    );
+                    assert!(
+                        !add_beta_background.is_error(),
+                        "background modified click failed: {}",
+                        add_beta_background.text()
+                    );
+                    std::thread::sleep(Duration::from_millis(300));
+                    let after_background = snapshot_elements(driver, pid, wid);
+                    assert!(
+                        after_background
+                            .tree_text()
+                            .contains("selection=alpha,beta"),
+                        "background modified click replaced or lost the prior selection:\n{}",
+                        after_background.tree_text()
+                    );
+                    after_background
+                },
+            )
+            .expect("background modifier click violated desktop isolation");
 
-            let beta = element_token_by_id(&after_refusal, "selection-beta");
+            // Reset the selection before exercising the unchanged foreground route.
+            let alpha = element_token_by_id(&after_background, "selection-alpha");
+            let reset = driver.call("click", serde_json::json!({ "element_token": alpha }));
+            assert!(
+                !reset.is_error(),
+                "reset selection failed: {}",
+                reset.text()
+            );
+            let before_foreground = snapshot_elements(driver, pid, wid);
+            assert!(before_foreground.tree_text().contains("selection=alpha"));
+            let beta = element_token_by_id(&before_foreground, "selection-beta");
             let add_beta = driver.call(
                 "click",
                 serde_json::json!({
@@ -1875,7 +1892,7 @@ fn harness_appkit_modified_click_preserves_selection() {
                 "modified click replaced or lost the prior selection:\n{}",
                 post.tree_text()
             );
-            Observation::delivered_with_fixture_state(Vec::new())
+            Observation::delivered_with_fixture_state(passed)
         },
     );
 }

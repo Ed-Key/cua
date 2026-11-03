@@ -221,10 +221,12 @@ and keep each claim narrow:
    the inline editor proves only that the editor changed; it does not prove the
    filesystem rename committed.
 2. For a multi-selection, use the platform modifier (`cmd` on macOS, `ctrl` on
-   Windows/Linux). With authorization for visible control on macOS and Windows, issue that modified click with
-   `delivery_mode:"foreground"` so the target observes physical modifier state;
-   a refused background attempt is an escalation signal, not a failed action to
-   trust or repeat. Re-snapshot before the next operation. Continue only when
+   Windows/Linux). On macOS, issue that modified click with background delivery;
+   mouse events carry modifier flags without changing the user's keyboard or
+   pointer. On Windows, with authorization for visible control, issue that modified click with
+   `delivery_mode:"foreground"` so the target observes physical modifier state.
+   A refused background attempt is an escalation signal. Re-snapshot before
+   the next operation. Continue only when
    every intended item is selected and the prior selection was preserved.
 3. After a cross-window drag or paste, verify the destination contains the
    complete expected set and the source reflects copy-versus-move semantics.
