@@ -317,11 +317,13 @@ fn track_queued_cursor_move(point: CGPoint) {
 
 /// Waits for a HID gesture's button events to pass every session tap. One
 /// still held is noted unresolved, so the pointer restore and the front
-/// hand-back keep waiting for it.
-fn settle_hid_gesture(baseline: ButtonCounters, backlog: [u32; 6], types: [CGEventType; 2]) {
-    if await_hid_passage(baseline, backlog, types, 1) == HidPassage::Pending {
-        note_unresolved(baseline);
+/// hand-back keep waiting for it, and is reported like a held click.
+fn settle_hid_gesture(baseline: ButtonCounters, backlog: [u32; 6], types: [CGEventType; 2]) -> anyhow::Result<()> {
+    if await_hid_passage(baseline, backlog, types, 1) != HidPassage::Pending {
+        return Ok(());
     }
+    note_unresolved(baseline);
+    Err(ClickNotConfirmed { tap_owner: foreign_active_tap(event_mask(&types)), waited: HID_PASSAGE_TIMEOUT }.into())
 }
 
 impl Drop for CursorRestore {
@@ -1743,9 +1745,9 @@ where
         Ok(())
     });
 
-    settle_hid_gesture(baseline, backlog, [down_type, up_type]);
+    let settled = settle_hid_gesture(baseline, backlog, [down_type, up_type]);
     std::thread::sleep(std::time::Duration::from_millis(100));
-    result
+    result.and(settled)
 }
 
 /// Foreground drag through the global HID event tap.
@@ -1885,12 +1887,12 @@ where
         }
         Ok(())
     });
-    settle_hid_gesture(baseline, backlog, [down_type, up_type]);
+    let settled = settle_hid_gesture(baseline, backlog, [down_type, up_type]);
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID
     // gesture, including pointer-capture release, before that restore happens.
     std::thread::sleep(std::time::Duration::from_millis(100));
-    result
+    result.and(settled)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

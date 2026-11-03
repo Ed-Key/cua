@@ -830,6 +830,23 @@ impl Tool for ClickTool {
 
             // AX actions cannot carry modifiers. Reuse the admitted pixel route
             // without changing global keyboard state or activating the target.
+            // That route is a press, so any other action would change meaning.
+            if background_modifier_click(delivery_mode.is_foreground(), !modifiers.is_empty())
+                && effective_action != "press"
+            {
+                return ToolResult::error(format!(
+                    "Background modifier clicks carry only a press; action \"{effective_action}\" \
+                     with modifiers has no background route."
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "background_unavailable",
+                    "effect": "refused",
+                    "escalation": {
+                        "recommended": "foreground",
+                        "reason": "Only a press can carry modifiers in the background"
+                    }
+                }));
+            }
             if background_modifier_click(delivery_mode.is_foreground(), !modifiers.is_empty()) {
                 return self
                     .click_element_by_pointer(
