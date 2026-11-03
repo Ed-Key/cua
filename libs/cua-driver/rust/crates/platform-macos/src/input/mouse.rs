@@ -241,6 +241,14 @@ impl CursorRestoreState {
         self.last = Some(next);
     }
 
+    /// A queued HID move: the hardware cursor reaches `next` only as the
+    /// window server drains the queue, so the current position proves nothing.
+    fn queued_to(&mut self, next: CGPoint) {
+        if self.prior.is_some() {
+            self.last = Some(next);
+        }
+    }
+
     fn restore_to(&self, current: CGPoint) -> Option<CGPoint> {
         self.last
             .filter(|last| !self.user_moved && cursor_still_at(current, *last))
@@ -297,6 +305,23 @@ fn track_cursor_move(point: CGPoint) -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+fn track_queued_cursor_move(point: CGPoint) {
+    CURSOR_RESTORE.with_borrow_mut(|state| {
+        if let Some(state) = state {
+            state.queued_to(point);
+        }
+    });
+}
+
+/// Waits for a HID gesture's button events to pass every session tap. One
+/// still held is noted unresolved, so the pointer restore and the front
+/// hand-back keep waiting for it.
+fn settle_hid_gesture(baseline: ButtonCounters, backlog: [u32; 6], types: [CGEventType; 2]) {
+    if await_hid_passage(baseline, backlog, types, 1) == HidPassage::Pending {
+        note_unresolved(baseline);
+    }
 }
 
 impl Drop for CursorRestore {
@@ -1656,6 +1681,8 @@ where
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
+    let _dispatching = Dispatching::begin();
+    let (baseline, backlog) = hid_baseline();
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for (spec, event) in events {
             let (click_state, event_button_number, subtype) = match spec.kind {
@@ -1719,6 +1746,7 @@ where
         Ok(())
     });
 
+    settle_hid_gesture(baseline, backlog, [down_type, up_type]);
     std::thread::sleep(std::time::Duration::from_millis(100));
     result
 }
@@ -1834,9 +1862,11 @@ where
     observe(from_x, from_y);
     std::thread::sleep(std::time::Duration::from_millis(40));
 
+    let _dispatching = Dispatching::begin();
+    let (baseline, backlog) = hid_baseline();
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         for (spec, event) in events {
-            track_cursor_move(spec.point)?;
+            track_queued_cursor_move(spec.point);
             event.set_flags(flags);
             crate::focus_steal::post_hid_mouse_event(&event);
 
@@ -1858,6 +1888,7 @@ where
         }
         Ok(())
     });
+    settle_hid_gesture(baseline, backlog, [down_type, up_type]);
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID
     // gesture, including pointer-capture release, before that restore happens.
@@ -2604,6 +2635,24 @@ mod tests {
         state.moving_to(prior, start);
         state.moving_to(start, start);
         state.moving_to(start, end);
+        assert_eq!(
+            state.restore_to(end).map(|p| (p.x, p.y)),
+            Some((prior.x, prior.y))
+        );
+    }
+
+    #[test]
+    fn queued_drag_moves_restore_once_the_cursor_reaches_the_end() {
+        let prior = CGPoint::new(-100.0, -50.0);
+        let start = CGPoint::new(20.0, 30.0);
+        let end = CGPoint::new(200.0, 300.0);
+        let mut state = CursorRestoreState::default();
+        state.moving_to(prior, start);
+        // The cursor lags behind queued posts; that is not the user.
+        state.queued_to(CGPoint::new(110.0, 165.0));
+        state.queued_to(end);
+        assert!(!state.user_moved);
+        assert!(state.restore_to(CGPoint::new(110.0, 165.0)).is_none());
         assert_eq!(
             state.restore_to(end).map(|p| (p.x, p.y)),
             Some((prior.x, prior.y))
