@@ -2012,7 +2012,15 @@ fn focus_typing_element(
     // window's remembered first responder by now and this write lands *after*
     // it rather than being clobbered by it. Re-applying once on a failed
     // read-back covers apps that install their responder slightly late.
+    //
+    // An element that already holds focus gets no write: it changes nothing,
+    // and WebKit can kill the page's process on it (an assertion in
+    // AccessibilityNodeObject::setFocused for Gmail's focused To field; Safari
+    // reloads the page and the draft is lost).
     if let Some((ptr, _)) = element_ptr_and_idx {
+        if crate::input::ax_actions::is_element_focused(pid, ptr) {
+            return Ok(());
+        }
         let _ = crate::input::ax_actions::focus_element(ptr);
         if reapply && !crate::input::ax_actions::is_element_focused(pid, ptr) {
             std::thread::sleep(FOCUS_REAPPLY_DELAY);
