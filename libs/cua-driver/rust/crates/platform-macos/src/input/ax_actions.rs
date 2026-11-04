@@ -928,6 +928,16 @@ mod tests {
     }
 
     #[test]
+    fn focus_element_writes_only_to_an_unfocused_element() {
+        let fixture = crate::ax::bindings::test_support::EditorScope::install("AXTextField", None, || {});
+        focus_element(fixture.element_ptr()).unwrap();
+        assert_eq!(fixture.focus_writes(), 0, "already focused: no write");
+        fixture.unfocus();
+        focus_element(fixture.element_ptr()).unwrap();
+        assert_eq!(fixture.focus_writes(), 1);
+    }
+
+    #[test]
     fn selection_fallback_is_limited_to_collection_item_roles() {
         for role in ["AXRow", "AXCell", "AXListItem", "AXImage"] {
             assert!(is_selectable_container_role(role), "{role}");
@@ -939,7 +949,15 @@ mod tests {
 }
 
 /// Set AXFocused=true on an element (for pre-focusing before key press).
+///
+/// An element that already reports AXFocused=true gets no write: it changes
+/// nothing, and WebKit can kill the page's process on it (an assertion in
+/// AccessibilityNodeObject::setFocused for Gmail's focused To field; Safari
+/// reloads the page and the draft is lost).
 pub fn focus_element(element_ptr: usize) -> anyhow::Result<()> {
+    if unsafe { copy_bool_attr(element_ptr as AXUIElementRef, "AXFocused") } == Some(true) {
+        return Ok(());
+    }
     let err = unsafe { set_bool_attr_true(element_ptr as AXUIElementRef, "AXFocused") };
     if err == kAXErrorSuccess {
         Ok(())

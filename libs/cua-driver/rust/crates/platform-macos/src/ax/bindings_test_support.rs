@@ -136,6 +136,11 @@ pub(super) fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<Op
 }
 
 pub(super) fn copy_bool_attr(element: AXUIElementRef, attr: &str) -> Option<Option<bool>> {
+    if attr == "AXFocused" {
+        if let Some(focused) = with_editor(element, |fixture| fixture.focused) {
+            return Some(Some(focused));
+        }
+    }
     with_fixture(element, |fixture| match attr {
         "AXEnabled" => Some(true),
         "AXSelected" => {
@@ -225,8 +230,9 @@ pub(super) fn perform_action(element: AXUIElementRef, action: &str) -> Option<AX
 pub(super) fn set_bool_attr_true(element: AXUIElementRef, attr: &str) -> Option<AXError> {
     // The focus write is accepted and, as a background Safari page does,
     // changes nothing.
-    if let Some(result) = with_editor(element, |_| {
+    if let Some(result) = with_editor(element, |fixture| {
         assert_eq!(attr, "AXFocused");
+        fixture.focus_writes += 1;
         kAXErrorSuccess
     }) {
         return Some(result);
@@ -262,6 +268,7 @@ struct EditorFixture {
     /// does nothing, `None` is not offered.
     press: Option<bool>,
     presses: usize,
+    focus_writes: usize,
     /// The exact window reports the web area itself as focused.
     page_focused: bool,
 }
@@ -290,6 +297,7 @@ impl EditorScope {
                 web_area: None,
                 press: None,
                 presses: 0,
+                focus_writes: 0,
                 page_focused: false,
             });
         });
@@ -324,6 +332,10 @@ impl EditorScope {
     /// Report the page (the web area) as the window's focused element.
     pub fn focus_page(&self) {
         EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().page_focused = true);
+    }
+
+    pub fn focus_writes(&self) -> usize {
+        EDITOR.with(|slot| slot.borrow().as_ref().unwrap().focus_writes)
     }
 
     pub fn presses(&self) -> usize {
