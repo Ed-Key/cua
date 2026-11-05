@@ -27,8 +27,6 @@ on:
       - "docs/content/docs/**"
       - "docs/code-block-policy.json"
       - ".github/workflows/e2e-cua-sdk.yml"
-  schedule:
-    - cron: "23 7 * * *"
   workflow_dispatch:
     inputs:
       lanes:

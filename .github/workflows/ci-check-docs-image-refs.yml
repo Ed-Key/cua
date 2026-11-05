@@ -21,8 +21,6 @@ on:
       - "scripts/images/doctor_ledger.py"
       - "scripts/images/docs-image-refs-baseline.json"
       - ".github/workflows/ci-check-docs-image-refs.yml"
-  schedule:
-    - cron: "11 7 * * *"
   workflow_dispatch:
 
 permissions:
